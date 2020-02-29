@@ -78,5 +78,11 @@ void initializeClangOpenMPParalleizationPass(PassRegistry &Registry);
 
 /// Create a pass to perform OpenMP-based parallelization.
 ModulePass* createClangOpenMPParallelization();
+
+/// Initialize a pass to perform DVM-based parallelization.
+void initializeClangDVMParalleizationPass(PassRegistry& Registry);
+
+/// Create a pass to perform DVM-based parallelization.
+ModulePass* createClangDVMParallelization();
 }
 #endif//TSAR_CLANG_TRANSFORM_PASSES_H
