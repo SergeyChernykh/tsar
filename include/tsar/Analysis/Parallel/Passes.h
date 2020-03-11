@@ -40,8 +40,14 @@ void initializeParallelizationAnalysis(PassRegistry &Registry);
 /// in a parallel way.
 void initializeParallelLoopPassPass(PassRegistry &Registry);
 
+void initializeLoopDefLiveVarInfoPassPass(PassRegistry& Registry);
+
+
 /// Initialize a pass to determine loops which could be executed
 /// in a parallel way.
 FunctionPass *createParallelLoopPass();
+
+FunctionPass *createLoopDefLiveVarInfoPassPass();
+
 }
 #endif//TSAR_PARALLEL_ANALYSIS_PASSES_H

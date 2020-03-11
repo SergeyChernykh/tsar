@@ -39,7 +39,9 @@
 #include "tsar/Analysis/Memory/Passes.h"
 #include "tsar/Analysis/Memory/ServerUtils.h"
 #include "tsar/Analysis/Memory/EstimateMemory.h"
+
 #include "tsar/Analysis/Parallel/ParallelLoop.h"
+#include "tsar/Analysis/Parallel/LoopDefLiveVarInfo.h"
 #include "tsar/Core/Query.h"
 #include "tsar/Core/TransformationContext.h"
 #include "tsar/Support/Clang/Diagnostic.h"
@@ -81,7 +83,7 @@ using ClangDVMServerProvider =
 using ClangDVMServerResponse = AnalysisResponsePass<
     GlobalsAAWrapperPass, DIMemoryTraitPoolWrapper, DIMemoryEnvironmentWrapper,
     GlobalDefinedMemoryWrapper, GlobalLiveMemoryWrapper,
-    ClonedDIMemoryMatcherWrapper, ClangDVMServerProvider>;
+    ClonedDIMemoryMatcherWrapper, ClangDVMServerProvider, LoopDefLiveVarInfoPass>;
 
 /// This analysis server performs transformation-based analysis which is
 /// necessary for DVM-based parallelization.
@@ -146,6 +148,7 @@ std::array<SortedVarListT, trait::DIReduction::RK_NumberOf>;
 /// a parallel program.
 class ClangDVMParalleization : public ModulePass, private bcl::Uncopyable {
 public:
+
   static char ID;
   ClangDVMParalleization() : ModulePass(ID) {
     initializeClangDVMParalleizationPass(*PassRegistry::getPassRegistry());
@@ -170,6 +173,12 @@ private:
 
   /// Initialize provider before on the fly passes will be run on server.
   void initializeProviderOnServer();
+
+  void findLoopDefLiveInfo(Function* F, ClangDVMParalleizationProvider& P,
+    clang::Rewriter& Rewriter);
+
+  SmallString<128>& buildPragma(SmallString<128> Prefix,
+    llvm::DenseSet<DIVariable*> Vars);
 
   TransformationContext *mTfmCtx = nullptr;
   const GlobalOptions *mGlobalOpts = nullptr;
@@ -459,6 +468,58 @@ void ClangDVMParalleization::initializeProviderOnServer() {
     });
 }
 
+void ClangDVMParalleization::findLoopDefLiveInfo(Function* F,
+  ClangDVMParalleizationProvider& P, clang::Rewriter& Rewriter) {
+  auto RF =
+    mSocket->getAnalysis<LoopDefLiveVarInfoPass>(*F);
+  assert(RF && "Dependence analysis must be available for a parallel loop!");
+  auto RM = mSocket->getAnalysis<AnalysisClientServerMatcherWrapper,
+    ClonedDIMemoryMatcherWrapper>();
+  assert(RM && "Client to server IR-matcher must be available!");
+  auto& ClientToServer = **RM->value<AnalysisClientServerMatcherWrapper*>();
+  auto& LDLI = RF->value<LoopDefLiveVarInfoPass*>()->getLoopDefLiveVarInfoInfo();
+  auto& LI = P.get<LoopInfoWrapperPass>().getLoopInfo();
+  auto& PL = P.get<ParallelLoopPass>().getParallelLoopInfo();
+  auto& CL = P.get<CanonicalLoopPass>().getCanonicalLoopInfo();
+  auto& RI = P.get<DFRegionInfoPass>().getRegionInfo();
+
+  for (auto& L : LI) {
+    if (PL.count(L)) {
+      assert(L->getLoopID() && "ID must be available for a parallel loop!");
+      auto ServerLoopID = cast<MDNode>(*ClientToServer.getMappedMD(L->getLoopID()));
+      auto LDLILoop = LDLI[ServerLoopID];
+      SmallString<128> Actual("#pragma dvm actual(");
+      SmallString<128> GetActual("\n#pragma dvm get_actual(");
+      auto CanonicalItr = CL.find_as(RI.getRegionFor(L));
+      auto* ForStmt = (**CanonicalItr).getASTLoop();
+      assert(ForStmt && "Source-level loop representation must be available!");
+      auto& Defs = LDLILoop.first;
+      Actual = buildPragma(Actual, Defs);
+      Actual += '\n';
+      Rewriter.InsertTextBefore(ForStmt->getLocStart(), Actual);
+      auto& Lives = LDLILoop.second;
+      GetActual = buildPragma(GetActual, Lives);
+      Rewriter.InsertTextAfterToken(ForStmt->getLocEnd(), GetActual);
+    }
+  }
+}
+
+SmallString<128>& ClangDVMParalleization::buildPragma(SmallString<128> Prefix,
+  llvm::DenseSet<DIVariable*> Vars) {
+  auto& pragma = Prefix;
+  bool flag = false;
+  for (auto var : Vars) {
+    if (var == nullptr)
+      continue;
+    if (flag)
+      pragma += ",";
+    pragma += var->getName();
+    flag = true;
+  }
+  pragma += ')';
+  return pragma;
+}
+
 bool ClangDVMParalleization::runOnModule(Module &M) {
   releaseMemory();
   mTfmCtx = getAnalysis<TransformationEnginePass>().getContext(M);
@@ -500,41 +561,11 @@ bool ClangDVMParalleization::runOnModule(Module &M) {
                                                   OptimizationRegion::CS_No;
                                          }))
       continue;
-    dbgs() << "[DVM PARALLEL]: process function " << F->getName()
-                      << "\n";
-    auto &Provider = getAnalysis<ClangDVMParalleizationProvider>(*F);    
-    auto &LI = Provider.get<LoopInfoWrapperPass>().getLoopInfo();
-    auto& LM = Provider.get<LiveMemoryPass>().getLiveInfo();
-    auto& RegInfo = Provider.get<DFRegionInfoPass>().getRegionInfo();
-    auto& PL = Provider.get<ParallelLoopPass>().getParallelLoopInfo();
-    auto& AT = Provider.get<EstimateMemoryPass>().getAliasTree();
-    auto& DT = Provider.get<DominatorTreeWrapperPass>().getDomTree();
-    auto RF =
-      mSocket->getAnalysis<DIEstimateMemoryPass, DIDependencyAnalysisPass>(*F);
-    assert(RF && "Dependence analysis must be available for a parallel loop!");
-    auto& DIAT = RF->value<DIEstimateMemoryPass*>()->getAliasTree();
-    auto& DL = F->getParent()->getDataLayout();
 
-    for (auto LIter = LI.begin(), End = LI.end(); LIter != End; LIter++) {
-      llvm::Loop* L = *LIter;
-      if (PL.count(L)) {
-        dbgs() << (L)->getName() << "\n";
-        auto& LMR = LM[RegInfo.getRegionFor(L)].get()->getOut();
-        dbgs() << "Live Variables: \n";
-        for (auto& MLR : LMR) {
-          auto* EM = AT.find(MLR);
-          assert(EM && "Estimate memory must be presented in alias tree!");
-          auto RawDIM = getRawDIMemoryIfExists(
-            *EM->getTopLevelParent(), F->getContext(), DL, DT);
-          assert(RawDIM && "Unknown raw memory!");
-          assert(DIAT.find(*RawDIM) != DIAT.memory_end() &&
-            "Memory must exist in alias tree!");
-          auto& DIEM = cast<DIEstimateMemory>(*DIAT.find(*RawDIM));
-          auto Var = DIEM.getVariable();
-          dbgs() << "\t" << Var->getName() << "\n";
-        }
-      }
-    }
+    auto& SrcMgr = mTfmCtx->getRewriter().getSourceMgr();
+    auto& Rewriter = mTfmCtx->getRewriter();
+    auto &Provider = getAnalysis<ClangDVMParalleizationProvider>(*F);    
+    findLoopDefLiveInfo(F, Provider, Rewriter);
   }
   return false;
 }
@@ -600,6 +631,7 @@ INITIALIZE_PASS_DEPENDENCY(LiveMemoryPass)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(CanonicalLoopPass)
 INITIALIZE_PASS_DEPENDENCY(ClangRegionCollector)
+INITIALIZE_PASS_DEPENDENCY(LoopDefLiveVarInfoPass)
 INITIALIZE_PASS_IN_GROUP_END(ClangDVMParalleization, "clang-dvm-parallel",
                              "DVM Based Parallelization (Clang)", false,
                              false,

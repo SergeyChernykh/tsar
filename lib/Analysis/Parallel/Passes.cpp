@@ -29,4 +29,6 @@ using namespace llvm;
 
 void llvm::initializeParallelizationAnalysis(PassRegistry &Registry) {
   initializeParallelLoopPassPass(Registry);
+  initializeLoopDefLiveVarInfoPassPass(Registry);
+
 }
