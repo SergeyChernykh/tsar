@@ -28,10 +28,7 @@
 
 #include "tsar/Analysis/Parallel/Passes.h"
 #include "tsar/Analysis/Memory/DIEstimateMemory.h"
-
-#include "bcl/utility.h"
 #include <llvm/ADT/DenseSet.h>
-#include <llvm/Pass.h>
 
 namespace llvm {
   class Loop;
@@ -39,7 +36,7 @@ namespace llvm {
 
 namespace tsar {
   /// List of loops which could be executed in a parallel way.
-  using LoopDefLiveInfo = llvm::DenseMap<llvm::MDNode*, //loopid
+  using LoopDefLiveInfo = llvm::DenseMap<llvm::MDNode*,
     std::pair<
     llvm::DenseSet<llvm::DIVariable*>,
     llvm::DenseSet<llvm::DIVariable*>>>;

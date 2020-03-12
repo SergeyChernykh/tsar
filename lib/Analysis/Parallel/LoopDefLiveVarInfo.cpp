@@ -25,18 +25,10 @@
 
 #include "tsar/Analysis/Parallel/LoopDefLiveVarInfo.h"
 #include "tsar/Analysis/Parallel/ParallelLoop.h"
-#include "tsar/Analysis/AnalysisServer.h"
 #include "tsar/Analysis/DFRegionInfo.h"
-#include "tsar/Analysis/Memory/DIDependencyAnalysis.h"
-#include "tsar/Analysis/Memory/DIEstimateMemory.h"
-#include "tsar/Analysis/Memory/MemoryTraitUtils.h"
 #include "tsar/Analysis/Memory/LiveMemory.h"
 #include "tsar/Analysis/Memory/EstimateMemory.h"
-#include "tsar/Support/GlobalOptions.h"
-#include "tsar/Support/IRUtils.h"
-#include "tsar/Support/Utils.h"
-#include "tsar/Transform/IR/InterprocAttr.h"
-#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/IR/Dominators.h>
 
 #undef DEBUG_TYPE
 #define DEBUG_TYPE "loop-dl-info"
