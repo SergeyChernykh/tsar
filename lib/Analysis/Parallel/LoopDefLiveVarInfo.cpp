@@ -38,6 +38,7 @@ using namespace tsar;
 char LoopDefLiveVarInfoPass::ID = 0;
 INITIALIZE_PASS_BEGIN(LoopDefLiveVarInfoPass, "loop-dl-info",
   "Def Live Loop Analysis", true, true)
+  INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
   INITIALIZE_PASS_DEPENDENCY(ParallelLoopPass)
   INITIALIZE_PASS_DEPENDENCY(DFRegionInfoPass)
   INITIALIZE_PASS_DEPENDENCY(LiveMemoryPass)
@@ -50,6 +51,7 @@ INITIALIZE_PASS_END(LoopDefLiveVarInfoPass, "loop-dl-info",
   "Def Live Loop Analysis",true, true)
 
 void LoopDefLiveVarInfoPass::getAnalysisUsage(AnalysisUsage& AU) const {
+  AU.addRequired<LoopInfoWrapperPass>();
   AU.addRequired<ParallelLoopPass>();
   AU.addRequired<DFRegionInfoPass>();
   AU.addRequired<LiveMemoryPass>();
@@ -71,14 +73,18 @@ void FindVars(DenseSet<DIVariable*>& VarSet, Function& F,
     assert(RawDIM && "Unknown raw memory!");
     assert(DIAT.find(*RawDIM) != DIAT.memory_end() &&
       "Memory must exist in alias tree!");
-    auto& DIEM = cast<DIEstimateMemory>(*DIAT.find(*RawDIM));
-    auto Var = DIEM.getVariable();;
-    VarSet.insert(Var);
+    auto& MI = *DIAT.find(*RawDIM);
+    if (isa<DIEstimateMemory>(MI)) {
+      auto& DIEM = cast<DIEstimateMemory>(MI);
+      auto Var = DIEM.getVariable();
+      VarSet.insert(Var);
+    }
   }
 }
 
 bool LoopDefLiveVarInfoPass::runOnFunction(Function& F) {
-  auto& PL = getAnalysis<ParallelLoopPass>().getParallelLoopInfo();
+  dbgs() << "hello\n";
+  auto& PL = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
   auto& RI = getAnalysis<DFRegionInfoPass>().getRegionInfo();
   auto& LM = getAnalysis<LiveMemoryPass>().getLiveInfo();
   auto& DM = getAnalysis<DefinedMemoryPass>().getDefInfo();
@@ -88,20 +94,19 @@ bool LoopDefLiveVarInfoPass::runOnFunction(Function& F) {
   auto& DL = F.getParent()->getDataLayout();
 
   for (auto LIter = PL.begin(), End = PL.end(); LIter != End; LIter++) {
+    (*LIter)->dump();
     auto L = *LIter;
     auto LID = L->getLoopID();
     if (!mLoopDefLiveInfo.count(LID)) {
       mLoopDefLiveInfo.try_emplace(LID);
     }
     auto Region = RI.getRegionFor(L);
-    auto& DefsR = (*std::get<0>(DM[Region])).getDefs();
-    auto& MayDefsR = (*std::get<0>(DM[Region])).getMayDefs();
     auto& UsesR = (*std::get<0>(DM[Region])).getUses();
     auto& LMR = LM[Region].get()->getOut();
-    FindVars(mLoopDefLiveInfo[LID].first, F, DefsR, AT, DT, DL, DIAT);
-    FindVars(mLoopDefLiveInfo[LID].first, F, MayDefsR, AT, DT, DL, DIAT);
     FindVars(mLoopDefLiveInfo[LID].first, F, UsesR, AT, DT, DL, DIAT);
     FindVars(mLoopDefLiveInfo[LID].second, F, LMR, AT, DT, DL, DIAT);
+    for (auto var : mLoopDefLiveInfo[LID].second)
+      dbgs() << var->getName() << "\n";
   }
   return false;
 }

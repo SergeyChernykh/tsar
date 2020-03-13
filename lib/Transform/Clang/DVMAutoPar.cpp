@@ -62,14 +62,14 @@ static void initializeClangDVMServerResponsePass(PassRegistry &);
 namespace {
   /// This provides access to function-level analysis results on server.
   using ClangDVMServerProvider =
-    FunctionPassAAProvider<DIEstimateMemoryPass, DIDependencyAnalysisPass>;
+    FunctionPassAAProvider<DIEstimateMemoryPass, DIDependencyAnalysisPass, LoopDefLiveVarInfoPass>;
 
   /// List of responses available from server (client may request corresponding
   /// analysis, in case of provider all analysis related to a provider may
   /// be requested separately).
   using ClangDVMServerResponse = AnalysisResponsePass<
     GlobalsAAWrapperPass, DIMemoryTraitPoolWrapper, DIMemoryEnvironmentWrapper,
-    ClangDVMServerProvider, LoopDefLiveVarInfoPass>;
+    ClangDVMServerProvider>;
 
   /// This analysis server performs transformation-based analysis which is
   /// necessary for DVM-based parallelization.
@@ -253,15 +253,24 @@ void ClangDVMParalleization::findLoopDefLiveInfo(Function* F,
     SmallString<128> Actual("#pragma dvm actual(");
     SmallString<128> GetActual("\n#pragma dvm get_actual(");
     auto CanonicalItr = CL.find_as(RI.getRegionFor(L));
+    if (CanonicalItr == CL.end() || !(**CanonicalItr).isCanonical())
+      continue;
     auto* ForStmt = (**CanonicalItr).getASTLoop();
+    dbgs() << "=====\n";
+    ForStmt->dump();
+    dbgs() << "=====\n";
     assert(ForStmt && "Source-level loop representation must be available!");
     auto& Defs = LDLILoop.first;
-    Actual = buildPragma(Actual, Defs);
-    Actual += '\n';
-    Rewriter.InsertTextBefore(ForStmt->getLocStart(), Actual);
+    if (!Defs.empty()) {
+      Actual = buildPragma(Actual, Defs);
+      Actual += '\n';
+      Rewriter.InsertTextBefore(ForStmt->getLocStart(), Actual);
+    }
     auto& Lives = LDLILoop.second;
-    GetActual = buildPragma(GetActual, Lives);
-    Rewriter.InsertTextAfterToken(ForStmt->getLocEnd(), GetActual);
+    if (!Lives.empty()) {
+      GetActual = buildPragma(GetActual, Lives);
+      Rewriter.InsertTextAfterToken(ForStmt->getLocEnd().getLocWithOffset(1), GetActual);
+    }
   }
 }
 
