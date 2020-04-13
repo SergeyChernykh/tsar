@@ -76,10 +76,13 @@ address_2
 address_3
 address_4
 address_5
+address_6
 pointer_1.safe
 pointer_2.safe
 pointer_3
 pointer_4
+pointer_5
+pointer_6
 reduction_1
 reduction_2
 reduction_3
@@ -94,6 +97,7 @@ interproc_3
 interproc_4
 interproc_5
 interproc_6
+interproc_7
 Jacobi
 Jacobi.func
 Adi.func

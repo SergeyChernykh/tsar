@@ -148,6 +148,7 @@ public:
           AddToRegionError = true;
         }
     }
+    return true;
   }
 
 private:
@@ -157,7 +158,6 @@ private:
   const LoopMatcherPass::LoopMatcher &mLoops;
   const ClangExprMatcherPass::ExprMatcher &mExprs;
   OptimizationRegionInfo &mRegions;
-  std::stack<Stmt *> mScopes;
   SmallVector<OptimizationRegion *, 4> mActiveRegions;
   Stmt *mNewPragma = nullptr;
   unsigned mNewActiveRegions = 0;

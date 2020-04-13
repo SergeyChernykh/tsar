@@ -40,6 +40,7 @@ class ForStmt;
 namespace tsar {
 class AnalysisSocketInfo;
 class ClangDependenceAnalyzer;
+class DIMemoryEnvironment;
 class OptimizationRegion;
 class TransformationContext;
 struct GlobalOptions;
@@ -101,9 +102,6 @@ private:
   /// Initialize provider before on the fly passes will be run on client.
   void initializeProviderOnClient(Module &M);
 
-  /// Initialize provider before on the fly passes will be run on server.
-  void initializeProviderOnServer();
-
   /// Check whether it is possible to parallelize a specified loop, analyze
   /// inner loops on failure.
   bool findParallelLoops(Loop &L, Function &F,
@@ -126,6 +124,7 @@ private:
   tsar::MemoryMatchInfo *mMemoryMatcher = nullptr;
   GlobalsAAResult * mGlobalsAA = nullptr;
   tsar::AnalysisSocketInfo *mSocketInfo = nullptr;
+  tsar::DIMemoryEnvironment *mDIMEnv = nullptr;
   SmallVector<const tsar::OptimizationRegion *, 4> mRegions;
 };
 
@@ -158,6 +157,7 @@ class ClangSMParallelizationInfo final : public tsar::PassGroupInfo {
   INITIALIZE_PASS_DEPENDENCY(ParallelLoopPass)                                 \
   INITIALIZE_PASS_DEPENDENCY(CanonicalLoopPass)                                \
   INITIALIZE_PASS_DEPENDENCY(ClangRegionCollector)                             \
+  INITIALIZE_PASS_DEPENDENCY(DIMemoryEnvironmentWrapper)                       \
   INITIALIZE_PASS_IN_GROUP_END(passName, arg, name, false, false,              \
                                TransformationQueryManager::getPassRegistry())
 #endif//TSAR_CLANG_SHARED_PARALLEL_H

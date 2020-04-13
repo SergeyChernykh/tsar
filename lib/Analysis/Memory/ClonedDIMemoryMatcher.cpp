@@ -25,12 +25,13 @@
 #include "tsar/Analysis/Memory/ClonedDIMemoryMatcher.h"
 #include "tsar/Analysis/Memory/DIEstimateMemory.h"
 #include "tsar/Analysis/Memory/Passes.h"
+#include "tsar/Support/MetadataUtils.h"
 #include "tsar/Unparse/Utils.h"
 #include <bcl/utility.h>
 #include <llvm/Pass.h>
 #include <llvm/Support/Debug.h>
 
-#define DEBUG_TYPE "cloned-di-memory-matcher"
+#define DEBUG_TYPE "di-memory-handle"
 
 using namespace llvm;
 using namespace tsar;
@@ -50,7 +51,7 @@ public:
     AU.addRequired<ClonedDIMemoryMatcherWrapper>();
   }
 private:
-  ClonedDIMemoryMatcher mMatcher;
+  ClonedDIMemoryMatcherInfo mMatcher;
 };
 
 /// This memory pass establishes relation between metadata-level memory
@@ -79,22 +80,25 @@ public:
 
   bool runOnFunction(Function &F) override {
     auto &DIAT = getAnalysis<DIEstimateMemoryPass>().getAliasTree();
-    auto &OriginToClone = getAnalysis<ClonedDIMemoryMatcherWrapper>().get();
+    auto *OriginToClone =
+        getAnalysis<ClonedDIMemoryMatcherWrapper>()->insert(F).first;
+    assert(OriginToClone && "Unable to create memory matcher!");
     for (auto &DIM : make_range(DIAT.memory_begin(), DIAT.memory_end())) {
-      auto Itr = mCloneToOrigin.find(DIM.getAsMDNode());
+      auto Itr = mCloneToOrigin.find(std::make_pair(&F, DIM.getAsMDNode()));
       // Some memory locations are always distinct after tree rebuilding.
       // So, this memory locations does not exist in the map.
       if (Itr == mCloneToOrigin.end()) {
-        LLVM_DEBUG(dbgs() << "[CLONED DI MEMORY]: original memory location is not "
-                             "found for ";
-                   printDILocationSource(dwarf::DW_LANG_C, DIM, dbgs());
-                   dbgs() << "\n");
+        LLVM_DEBUG(dbgs() << "[CLONED DI MEMORY]: original memory location "
+                             "is not found for '";
+                   if (auto DWLang = getLanguage(F))
+                       printDILocationSource(*DWLang, DIM, dbgs());
+                   dbgs() << "'\n");
         continue;
       }
-      OriginToClone.emplace(ClonedDIMemoryMatcher::value_type(
+      OriginToClone->emplace(ClonedDIMemoryMatcher::value_type(
         std::piecewise_construct,
-        std::forward_as_tuple(Itr->second, &OriginToClone),
-        std::forward_as_tuple(&DIM, &OriginToClone)));
+        std::forward_as_tuple(Itr->second, OriginToClone),
+        std::forward_as_tuple(&DIM, OriginToClone)));
     }
     return false;
   }

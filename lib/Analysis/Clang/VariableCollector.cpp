@@ -27,6 +27,7 @@
 #include "tsar/Analysis/Clang/VariableCollector.h"
 #include "tsar/Analysis/Memory/DIEstimateMemory.h"
 #include "tsar/Analysis/Memory/DIMemoryTrait.h"
+#include "tsar/Support/MetadataUtils.h"
 
 using namespace clang;
 using namespace llvm;
@@ -58,8 +59,10 @@ bool VariableCollector::VisitDeclRefExpr(clang::DeclRefExpr *DRE) {
     if (!Induction)
       Induction = VD;
     auto T = getCanonicalUnqualifiedType(VD);
-    CanonicalRefs.try_emplace(VD).first->second.resize(
-      numberOfPointerTypes(T) + 1, nullptr);
+    unsigned PtrTpNum = numberOfPointerTypes(T);
+    if (PtrTpNum == 0 && VD->getType().isConstQualified())
+      return true;
+    CanonicalRefs.try_emplace(VD).first->second.resize(PtrTpNum + 1, nullptr);
   }
   return true;
 }
@@ -85,13 +88,30 @@ VariableCollector::findDecl(const DIMemory &DIM,
     assert(DIVar && "Variable must not be null!");
     auto MatchItr = ASTToClient.find<MD>(DIVar);
     if (MatchItr == ASTToClient.end())
-      return std::make_pair(nullptr, Invalid);
+      if (isStubVariable(*DIVar))
+          return std::make_pair(nullptr, Unknown);
+      else
+        return std::make_pair(nullptr, Invalid);
     auto ASTRefItr = CanonicalRefs.find(MatchItr->get<AST>());
     if (ASTRefItr == CanonicalRefs.end())
       return std::make_pair(MatchItr->get<AST>(), Implicit);
     if (DIEM->getExpression()->getNumElements() > 0) {
       auto *Expr = DIEM->getExpression();
       auto NumDeref = llvm::count(Expr->getElements(), dwarf::DW_OP_deref);
+      // At first, check that metadata-level memory is larger then allocated
+      // memory. For example:
+      // - metadata memory location is <X, ?>
+      // - `int X`
+      // Size of X will be unknown if there is a call which takes &X as
+      // a parameter: bar(&X).
+      if (NumDeref == 0 && ASTRefItr->second.size() == 1 &&
+          Expr->isFragment() && Expr->getNumElements() == 3 &&
+          !DIEM->isSized()) {
+        ASTRefItr->second.front() = DIEM;
+        return std::make_pair(MatchItr->get<AST>(), isa<DILocalVariable>(DIVar)
+                                                        ? CoincideLocal
+                                                        : CoincideGlobal);
+      }
       auto *T = getCanonicalUnqualifiedType(ASTRefItr->first);
       // We want to be sure that current memory location describes all
       // possible memory locations which can be represented with a
@@ -156,12 +176,13 @@ bool VariableCollector::localize(DIMemoryTrait &T, const DIAliasNode &DIN,
     const ClonedDIMemoryMatcher &ClientToServer,
     SortedVarListT &VarNames, clang::VarDecl **Error) {
   auto Search = findDecl(*T.getMemory(), ASTToClient, ClientToServer);
+  // Do no specify traits for variables declared in a loop body
+  // these variables are private by default. Moreover, these variables are
+  // not visible outside the loop and could not be mentioned in clauses
+  // before loop.
+  if (Search.first && CanonicalLocals.count(Search.first))
+    return true;
   if (Search.second == VariableCollector::CoincideLocal) {
-    // Do no specify traits for variables declared in a loop body
-    // these variables are private by default. Moreover, these variables are
-    // not visible outside the loop and could not be mentioned in clauses
-    // before loop.
-    if (!CanonicalLocals.count(Search.first))
       VarNames.insert(Search.first->getName());
   } else if (Search.second == VariableCollector::CoincideGlobal) {
     VarNames.insert(Search.first->getName());

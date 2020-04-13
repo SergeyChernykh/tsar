@@ -99,7 +99,7 @@ void addInitialTransformations(legacy::PassManager &Passes) {
   Passes.add(createGlobalsAAWrapperPass());
   Passes.add(createNoMetadataDSEPass());
   Passes.add(createDILoopRetrieverPass());
-  Passes.add(createDIGlobalRetrieverPass());
+  Passes.add(createDINodeRetrieverPass());
 }
 
 void addBeforeTfmAnalysis(legacy::PassManager &Passes, StringRef AnalysisUse) {
@@ -246,6 +246,23 @@ void DefaultQueryManager::run(llvm::Module *M, TransformationContext *Ctx) {
     }
     delete P;
   };
+  if (mUseServer) {
+    Passes.add(createAnalysisSocketImmutableStorage());
+    Passes.add(createDIMemoryTraitPoolStorage());
+    Passes.add(createDIMemoryEnvironmentStorage());
+    Passes.add(createDIEstimateMemoryPass());
+    Passes.add(createDIMemoryAnalysisServer());
+    Passes.add(createAnalysisWaitServerPass());
+    Passes.add(createMemoryMatcherPass());
+    Passes.add(createAnalysisWaitServerPass());
+    addPrint(BeforeTfmAnalysis);
+    addOutput(BeforeTfmAnalysis);
+    Passes.add(createAnalysisReleaseServerPass());
+    Passes.add(createAnalysisCloseConnectionPass());
+    Passes.add(createVerifierPass());
+    Passes.run(*M);
+    return;
+  }
   Passes.add(createMemoryMatcherPass());
   Passes.add(createGlobalDefinedMemoryStorage());
   Passes.add(createGlobalLiveMemoryStorage());
@@ -302,7 +319,7 @@ void InstrLLVMQueryManager::run(llvm::Module *M, TransformationContext *Ctx) {
   }
   Passes.add(createUnreachableBlockEliminationPass());
   Passes.add(createNoMetadataDSEPass());
-  Passes.add(createDIGlobalRetrieverPass());
+  Passes.add(createDINodeRetrieverPass());
   Passes.add(createMemoryMatcherPass());
   Passes.add(createDILoopRetrieverPass());
   Passes.add(createInstrumentationPass(mInstrEntry, mInstrStart));

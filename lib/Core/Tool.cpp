@@ -113,6 +113,7 @@ struct Options : private bcl::Uncopyable {
   llvm::cl::opt<bool> PrintAST;
   llvm::cl::opt<bool> DumpAST;
   llvm::cl::opt<bool> TimeReport;
+  llvm::cl::opt<bool> UseServer;
 
   llvm::cl::opt<bool> PrintAll;
   llvm::cl::list<const PassInfo *, bool,
@@ -136,6 +137,8 @@ struct Options : private bcl::Uncopyable {
   llvm::cl::opt<bool> NoUnsafeTfmAnalysis;
   llvm::cl::opt<bool> ExternalCalls;
   llvm::cl::opt<bool> NoExternalCalls;
+  llvm::cl::opt<bool> MathErrno;
+  llvm::cl::opt<bool> NoMathErrno;
   llvm::cl::opt<std::string> AnalysisUse;
   llvm::cl::list<std::string> OptRegion;
 
@@ -199,6 +202,8 @@ Options::Options() :
     cl::desc("Build ASTs and then debug dump them")),
   TimeReport("ftime-report", cl::cat(DebugCategory),
     cl::desc("Print some statistics about the time consumed by each pass when it finishes")),
+  UseServer("use-analysis-server", cl::cat(DebugCategory),
+    cl::desc("Run default workflow on analysis server")),
   PrintAll("print-all", cl::cat(DebugCategory),
     cl::desc("Print all available results")),
   PrintOnly("print-only", cl::cat(DebugCategory), cl::CommaSeparated,
@@ -234,6 +239,10 @@ Options::Options() :
     cl::desc("Check whether a function could be called outside the analyzed module(default)")),
   NoExternalCalls("fno-external-calls", cl::cat(AnalysisCategory),
     cl::desc("Assume that functions are never called outside the analyzed module")),
+  MathErrno("fmath-errno", cl::cat(AnalysisCategory),
+     cl::desc("Require math functions to indicate errors by setting errno")),
+  NoMathErrno("fno-math-errno", cl::cat(AnalysisCategory),
+     cl::desc("Prevent math functions to indicate errors by setting errno")),
   AnalysisUse("fanalysis-use", cl::cat(AnalysisCategory),
     cl::value_desc("filename"),
     cl::desc("Use external analysis results to clarify analysis")),
@@ -343,12 +352,12 @@ Tool::Tool(int Argc, const char **Argv) {
   cl::PrintOptionValues();
 }
 
-inline static QueryManager * getDefaultQM(
+inline static QueryManager * getDefaultQM(bool UseServer,
     const DefaultQueryManager::PassList &OutputPasses,
     const DefaultQueryManager::PassList &PrintPasses,
     const DefaultQueryManager::ProcessingStep PrintSteps,
     const GlobalOptions &GlobalOpts) {
-  static DefaultQueryManager QM(&GlobalOpts,
+  static DefaultQueryManager QM(UseServer, &GlobalOpts,
     OutputPasses, PrintPasses, PrintSteps);
   return &QM;
 }
@@ -441,6 +450,16 @@ void Tool::storeCLOptions() {
     mCommandLine.push_back("-I" + Path);
   for (auto &Macro : Options::get().MacroDefs)
     mCommandLine.push_back("-D" + Macro);
+  if (Options::get().MathErrno && Options::get().NoMathErrno) {
+    std::string Msg("error - this option is incompatible with");
+    Msg.append(" -").append(Options::get().NoMathErrno.ArgStr);
+    Options::get().MathErrno.error(Msg);
+    exit(1);
+  }
+  if (Options::get().MathErrno)
+    mCommandLine.emplace_back("-fmath-errno");
+  if (Options::get().NoMathErrno)
+    mCommandLine.emplace_back("-fno-math-errno");
   mCompilations = std::unique_ptr<CompilationDatabase>(
     new FixedCompilationDatabase(".", mCommandLine));
   OptionList IncompatibleOpts;
@@ -530,13 +549,17 @@ void Tool::storeCLOptions() {
   mOutputFilename = Options::get().Output;
   storePrintOptions(IncompatibleOpts);
   mLanguage = Options::get().Language;
-#ifdef APC_FOUND
   /// TODO (kaniandr@gmail.com): allow to use -output-suffix option for
   /// instrumentation and emit LLVM passes.
-  bool NoTfmPass = mInstrLLVM || mEmitAST;
-#else
-  bool NoTfmPass = !mTfmPass;
-#endif
+  bool NoTfmPass = !mTfmPass && !mInstrLLVM && !mEmitLLVM;
+  mServer =
+      addIfSetIf(Options::get().UseServer, !mPrint && (!NoTfmPass || mCheck));
+  if (!Options::get().PrintStep.empty() && mServer) {
+    std::string Msg("error - this option is incompatible with");
+    Msg.append(" -").append(Options::get().PrintStep.ArgStr);
+    Options::get().UseServer.error(Msg);
+    exit(1);
+  }
   mGlobalOpts.NoFormat = addIfSetIf(Options::get().NoFormat, NoTfmPass);
   mGlobalOpts.OutputSuffix = Options::get().OutputSuffix;
   if (NoTfmPass && !mGlobalOpts.OutputSuffix.empty()) {
@@ -644,7 +667,7 @@ int Tool::run(QueryManager *QM) {
     else if (mCheck)
       QM = getCheckQM();
     else
-      QM = getDefaultQM(mOutputPasses, mPrintPasses,
+      QM = getDefaultQM(mServer, mOutputPasses, mPrintPasses,
         (DefaultQueryManager::ProcessingStep)mPrintSteps, mGlobalOpts);
   }
   auto ImportInfoStorage = QM->initializeImportInfo();

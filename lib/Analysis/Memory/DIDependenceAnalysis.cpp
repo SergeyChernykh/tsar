@@ -30,6 +30,7 @@
 #include "tsar/ADT/SpanningTreeRelation.h"
 #include "tsar/Analysis/Attributes.h"
 #include "tsar/Analysis/DFRegionInfo.h"
+#include "tsar/Analysis/KnownFunctionTraits.h"
 #include "tsar/Analysis/PrintUtils.h"
 #include "tsar/Analysis/Memory/DIEstimateMemory.h"
 #include "tsar/Analysis/Memory/EstimateMemory.h"
@@ -358,7 +359,6 @@ bool combineWith(Value *V, DIMemory &M, const AliasTree &AT,
     // location.
     if (MTraitItr == ATraitItr->unknown_end())
       return false;
-    LLVM_DEBUG(dbgs() << "[DA DI]: combine traits\n");
     auto CombinedTrait = BitMemoryTrait(DIMTrait);
     CombinedTrait &= *MTraitItr;
     // Do not use `operator=` because already attached values should not be lost.
@@ -367,6 +367,8 @@ bool combineWith(Value *V, DIMemory &M, const AliasTree &AT,
       DIMTrait.unset<trait::Redundant>();
     if (DIMTrait.is<trait::DirectAccess>())
       DIMTrait.unset<trait::IndirectAccess>();
+    LLVM_DEBUG(dbgs() << "[DA DI]: combine traits to ";
+               DIMTrait.print(dbgs()); dbgs() << "\n");
     return true;
   }
   AliasTrait::iterator MTraitItr = ATraitItr->end();
@@ -1083,14 +1085,14 @@ protected:
   EstimateCoverageT::iterator getEstimateCoverage(const EstimateMemory *EM) {
     auto Info = mEstimateCoverage.try_emplace(EM);
     if (Info.second)
-      Info.first->get<DIMemory>().push_back(nullptr);
+      Info.first->template get<DIMemory>().push_back(nullptr);
     return Info.first;
   }
 
   UnknownCoverageT::iterator getUnknownCoverage(const Value *V) {
     auto Info = mUnknownCoverage.try_emplace(V);
     if (Info.second)
-      Info.first->get<DIMemory>().push_back(nullptr);
+      Info.first->template get<DIMemory>().push_back(nullptr);
     return Info.first;
   }
 
@@ -1275,11 +1277,146 @@ private:
 };
 }
 
+void DIDependencyAnalysisPass::analyzePrivatePromoted(Loop *L,
+    Optional<unsigned> DWLang,
+    const SpanningTreeRelation<const tsar::DIAliasTree *> &DIAliasSTR,
+    ArrayRef<const DIMemory *> LockedTraits, DIMemoryTraitRegionPool &Pool) {
+  auto *Head = L->getHeader();
+  SmallVector<BasicBlock *, 1> ExitBlocks;
+  L->getExitBlocks(ExitBlocks);
+  // Collect first instructions outside the loop.
+  SmallVector<Instruction *, 1> ExitInsts;
+  llvm::transform(ExitBlocks, std::back_inserter(ExitInsts),
+                  [](BasicBlock *BB) { return &BB->front(); });
+  // For each instruction we determine variables which it uses. Then we explore
+  // instructions which computes values of these variables. We check whether
+  // these instructions and currently processes instruction are always executed
+  // on the same iteration.
+  SmallDenseSet<DIMemoryLocation, 8> OutwardUses, OutwardDefs, Privates;
+  for (auto *BB : L->blocks()) {
+    for (auto &I : *BB) {
+      if (auto II = dyn_cast<IntrinsicInst>(&I))
+        if (isDbgInfoIntrinsic(II->getIntrinsicID()) ||
+            isMemoryMarkerIntrinsic(II->getIntrinsicID()))
+          continue;
+      // If instruction computes a value of a variable, remember it.
+      // May be it is better to call this function for each instruction in
+      // ExitInsts separately because processing of all instruction is more
+      // conservative. In some cases a variable may have a value after one
+      // exit and it may not have a value after another exit. This variable
+      // could be a dynamic private (not private), so we simplify the check.
+      SmallVector<DIMemoryLocation, 4> DILocs;
+      findMetadata(&I, ExitInsts, *mDT, DILocs);
+      Privates.insert(DILocs.begin(), DILocs.end());
+      // Collect users of a specified instruction which are located outside the
+      // loop.
+      for_each_user_insts(I, [this, &I, L, &OutwardDefs](Value *V) {
+        if (auto *UI = dyn_cast<Instruction>(V)) {
+          if (L->contains(UI))
+            return;
+          SmallVector<DIMemoryLocation, 4> DILocs;
+          findMetadata(&I, makeArrayRef(UI), *mDT, DILocs);
+          OutwardDefs.insert(DILocs.begin(), DILocs.end());
+        }
+      });
+      SmallPtrSet<Instruction *, 4> VisitedInsts{ &I };
+      // If boolean value is set to true then value of a variable has been
+      // computed on previous iteration and data dependence exists.
+      SmallVector<PointerIntPair<Instruction *, 1, bool>, 4> Worklist;
+      Worklist.emplace_back(&I, isa<PHINode>(I) && I.getParent() == Head);
+      do {
+        auto CurrInst = Worklist.pop_back_val();
+        for (auto &Op : CurrInst.getPointer()->operands()) {
+          SmallVector<DIMemoryLocation, 4> DILocs;
+          if (auto *Phi = dyn_cast<PHINode>(CurrInst.getPointer()))
+            findMetadata(Op, makeArrayRef(&Phi->getIncomingBlock(Op)->back()),
+                         *mDT, DILocs);
+          else
+            findMetadata(Op, makeArrayRef(CurrInst.getPointer()), *mDT, DILocs);
+          if (!DILocs.empty()) {
+            if (CurrInst.getInt()) {
+              OutwardUses.insert(DILocs.begin(), DILocs.end());
+            } else if (isa<Instruction>(Op) &&
+                       L->contains(cast<Instruction>(Op))) {
+              Privates.insert(DILocs.begin(), DILocs.end());
+            } else {
+              SmallVector<DIMemoryLocation, 4> DILocsInHead;
+              findMetadata(Op, makeArrayRef(&Head->front()), *mDT,
+                           DILocsInHead);
+              // In some cases Op may be executed before the loop or it could be
+              // a constant expression. However, if memory location has other
+              // value before the loop it means that assignment statement is
+              // placed inside the loop. This assignment statement may use
+              // other variable which was calculated by Op to set value of
+              // analyzed memory location. In this case it can be privitized.
+              for (auto &DIDef : DILocs)
+                if (!llvm::count(DILocsInHead, DIDef))
+                  Privates.insert(DIDef);
+                else
+                  OutwardUses.insert(DIDef);
+            }
+          } else {
+            if (auto *OpI = dyn_cast<Instruction>(&Op))
+              if (VisitedInsts.insert(OpI).second)
+                Worklist.emplace_back(OpI, CurrInst.getInt() ||
+                  isa<PHINode>(Op) && OpI->getParent() == Head);
+          }
+        }
+      } while (!Worklist.empty());
+    }
+  }
+  for (auto &Candidate : Privates) {
+    if (OutwardUses.count(Candidate))
+      continue;
+    auto *MD =
+        getRawDIMemoryIfExists(L->getHeader()->getContext(), Candidate);
+    if (!MD)
+      continue;
+    auto DIMTraitItr = Pool.find_as(MD);
+    if (DIMTraitItr == Pool.end() || DIMTraitItr->getMemory()->isOriginal() ||
+        !DIMTraitItr->getMemory()->emptyBinding() ||
+        !DIMTraitItr->is_any<trait::Anti, trait::Flow, trait::Output,
+                             trait::LastPrivate, trait::SecondToLastPrivate,
+                             trait::FirstPrivate, trait::DynamicPrivate>() ||
+        isLockedTrait(*DIMTraitItr, LockedTraits, DIAliasSTR))
+      continue;
+    LLVM_DEBUG(if (DWLang) {
+      dbgs() << "[DA DI]: update traits for ";
+      printDILocationSource(*DWLang, *DIMTraitItr->getMemory(), dbgs());
+      dbgs() << "\n";
+    });
+    // Look up for users of an analyzed variable outside the loop.
+    if (OutwardDefs.count(Candidate)) {
+      // Do not unset 'first private' because it is not known whether a new
+      // value will be always set for a variable.
+      if (!DIMTraitItr->is<trait::LastPrivate>() &&
+          !DIMTraitItr->is<trait::SecondToLastPrivate>()) {
+        DIMTraitItr->set<trait::DynamicPrivate>();
+        LLVM_DEBUG(dbgs() << "[DA DI]: dynamic private variable found\n");
+        ++NumTraits.get<trait::DynamicPrivate>();
+      }
+    } else {
+      DIMTraitItr->set<trait::Private>();
+      LLVM_DEBUG(dbgs() << "[DA DI]: private variable found\n");
+      ++NumTraits.get<trait::DynamicPrivate>();
+    }
+  }
+}
+
 void DIDependencyAnalysisPass::analyzePromoted(Loop *L,
     Optional<unsigned> DWLang,
     const SpanningTreeRelation<const tsar::DIAliasTree *> &DIAliasSTR,
     ArrayRef<const DIMemory *> LockedTraits, DIMemoryTraitRegionPool &Pool) {
   assert(L && "Loop must not be null!");
+  LLVM_DEBUG(dbgs() << "[DA DI]: process loop at " << L->getStartLoc() << "\n");
+  for (auto &DIMTrait : Pool) {
+    if (DIMTrait.getMemory()->isOriginal() ||
+        !DIMTrait.getMemory()->emptyBinding() ||
+        isLockedTrait(DIMTrait, LockedTraits, DIAliasSTR))
+      continue;
+    DIMTrait.unset<trait::AddressAccess>();
+  }
+  analyzePrivatePromoted(L, DWLang, DIAliasSTR, LockedTraits, Pool);
   // If there is no preheader induction and reduction analysis will fail.
   if (!L->getLoopPreheader())
     return;
@@ -1719,6 +1856,37 @@ static void addLoopIntoQueue(DFNode *DFN, std::deque<DFLoop *> &LQ) {
   }
 }
 
+/// Check nodes with pointer dereference and investigate combined traits to
+/// ignore some of traits for memory locations.
+///
+/// The following case is checked:
+/// Alias Nodes (1): {x, *p}, (2) { ... p ... }.
+/// If traits for (p) is 'private' then traits for *p could be ignored and
+/// traits for (1) could be set to separate traits of x.
+static DIMemoryTraitRef *mayIgnoreDereference(DIAliasTrait &Trait,
+    const DIAliasTree &Tree, DIDependenceSet &DS,
+    const DenseMap<DIVariable *, DIMemory *> &VarToMemory) {
+  DIMemoryTraitRef *MainMemory = nullptr;
+  for (auto &T : Trait) {
+    if (isa<DIUnknownMemory>(T->getMemory()))
+      return nullptr;
+    auto *DIEM = cast<DIEstimateMemory>(T->getMemory());
+    if (DIEM->hasDeref()) {
+      auto MemoryItr = VarToMemory.find(DIEM->getVariable());
+      if (MemoryItr != VarToMemory.end()) {
+        auto TraitItr = DS.find_as(MemoryItr->second->getAliasNode());
+        if (TraitItr != DS.end() && TraitItr->is<trait::Private>())
+          continue;
+      }
+      return nullptr;
+    }
+    if (MainMemory)
+      return nullptr;
+    MainMemory = &T;
+  }
+  return MainMemory;
+}
+
 bool DIDependencyAnalysisPass::runOnFunction(Function &F) {
   releaseMemory();
   auto &GlobalOpts = getAnalysis<GlobalOptionsImmutableWrapper>().getOptions();
@@ -1766,11 +1934,16 @@ bool DIDependencyAnalysisPass::runOnFunction(Function &F) {
     auto &DepSet = PI.find(DFL)->get<DependenceSet>();
     auto &DIDepSet = mDeps.try_emplace(DILoop, DepSet.size()).first->second;
     analyzePromoted(L, DWLang, DIAliasSTR, LockedTraits, *Pool);
+    DenseMap<DIVariable *, DIMemory *> VarToMemory;
     for (auto *DIN : post_order(&DIAT)) {
       if (isa<DIAliasTopNode>(DIN))
         continue;
       analyzeNode(cast<DIAliasMemoryNode>(*DIN), DWLang, AliasSTR, DIAliasSTR,
         LockedTraits, GlobalOpts, DepSet, DIDepSet, *Pool);
+      for (auto &DIM : cast<DIAliasMemoryNode>(*DIN))
+        if (auto *DIEM = dyn_cast<DIEstimateMemory>(&DIM))
+          if (DIEM->getExpression()->getNumElements() == 0)
+            VarToMemory.try_emplace(DIEM->getVariable(), DIEM);
     }
     LLVM_DEBUG(dbgs() << "[DA DI]: set traits for a top level node\n");
     auto TopDIN = DIAT.getTopLevelNode();
@@ -1783,6 +1956,16 @@ bool DIDependencyAnalysisPass::runOnFunction(Function &F) {
         TopTraitItr->insert(DIMTraitItr);
     }
     combineTraits(GlobalOpts.IgnoreRedundantMemory, *TopTraitItr);
+    for (auto &AT : DIDepSet) {
+      if (AT.size() == 1 ||
+          !AT.is_any<trait::Anti, trait::Flow, trait::Output>())
+        continue;
+      if (auto *T = mayIgnoreDereference(AT, DIAT, DIDepSet, VarToMemory)) {
+        BitMemoryTrait BitTrait(**T);
+        BitTrait = dropUnitFlag(BitTrait);
+        bcl::trait::set(BitTrait.toDescriptor(0, NumTraits), AT);
+      }
+    }
     std::vector<const DIAliasNode *> Coverage;
     explicitAccessCoverage(DIDepSet, DIAT, Coverage,
       GlobalOpts.IgnoreRedundantMemory);
