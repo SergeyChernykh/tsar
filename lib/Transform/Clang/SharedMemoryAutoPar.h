@@ -31,6 +31,8 @@
 #include "tsar/Support/PassGroupRegistry.h"
 #include <bcl/utility.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/Analysis/PostDominators.h>
+#include <llvm/IR/Dominators.h>
 #include <llvm/Pass.h>
 
 namespace clang {
@@ -63,7 +65,8 @@ class ParallelLoopPass;
 using ClangSMParallelProvider =
     FunctionPassAAProvider<AnalysisSocketImmutableWrapper, LoopInfoWrapperPass,
                            ParallelLoopPass, CanonicalLoopPass, LoopMatcherPass,
-                           DFRegionInfoPass, ClangDIMemoryMatcherPass>;
+                           DFRegionInfoPass, ClangDIMemoryMatcherPass/*, DominatorTreeWrapperPass,
+                           PostDominatorTreeWrapperPass*/>;
 
 /// This pass try to insert directives into a source code to obtain
 /// a parallel program for a shared memory.
