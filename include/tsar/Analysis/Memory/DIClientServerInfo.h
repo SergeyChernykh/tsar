@@ -93,6 +93,9 @@ struct DIMemoryClientServerInfo : public DIClientServerInfo {
   /// \post if alias tree is not available on client this class becomes invalid.
   DIMemoryClientServerInfo(llvm::Pass &P, llvm::Function &F);
 
+  /// This is temporary constructor for module pass.
+  DIMemoryClientServerInfo(llvm::Pass& P, llvm::Function& F, DIAliasTree* DIAT);
+
   /// Return client-to-server memory pair for a specified estimate memory on
   /// client.
   ///

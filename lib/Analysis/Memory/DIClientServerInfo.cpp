@@ -94,6 +94,14 @@ DIMemoryClientServerInfo::DIMemoryClientServerInfo(
     return;
 }
 
+DIMemoryClientServerInfo::DIMemoryClientServerInfo(
+    llvm::Pass& P, llvm::Function& F, DIAliasTree* DIAT) 
+    : DIClientServerInfo(P, F) {
+  assert(DIAT != nullptr);
+  ClientDIAT = DIAT;
+}
+
+
 bcl::tagged_pair<
   bcl::tagged<DIMemory *, Origin>, bcl::tagged<DIMemory *, Clone>>
 DIMemoryClientServerInfo::findFromClient(EstimateMemory &EM,

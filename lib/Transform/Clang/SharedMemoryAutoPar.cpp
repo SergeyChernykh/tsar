@@ -36,6 +36,7 @@
 #include "tsar/Analysis/Memory/DIDependencyAnalysis.h"
 #include "tsar/Analysis/Memory/DIEstimateMemory.h"
 #include "tsar/Analysis/Memory/DIMemoryTrait.h"
+#include "tsar/Analysis/Memory/DIClientServerInfo.h"
 #include "tsar/Analysis/Memory/MemoryTraitUtils.h"
 #include "tsar/Analysis/Memory/Passes.h"
 #include "tsar/Analysis/Parallel/ParallelLoop.h"
@@ -129,7 +130,7 @@ bool ClangSMParallelization::findParallelLoops(
     *mGlobalOpts, Diags, DIAT, DIDepSet, *DIMemoryMatcher, ASTToClient);
   if (!RegionAnalysis.evaluateDependency())
     return findParallelLoops(L.begin(), L.end(), F, Provider);
-  if (!exploitParallelism(L, *ForStmt, Provider, RegionAnalysis, *mTfmCtx))
+  if (!exploitParallelism(L, *ForStmt, &F, Provider, RegionAnalysis, *mTfmCtx))
     return findParallelLoops(L.begin(), L.end(), F, Provider);
   return true;
 }
@@ -207,6 +208,7 @@ bool ClangSMParallelization::runOnModule(Module &M) {
     auto &Provider = getAnalysis<ClangSMParallelProvider>(*F);
     auto &LI = Provider.get<LoopInfoWrapperPass>().getLoopInfo();
     findParallelLoops(LI.begin(), LI.end(), *F, Provider);
+    finalize(*mTfmCtx);
   }
   return false;
 }

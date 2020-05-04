@@ -47,7 +47,7 @@ public:
   }
 private:
   bool exploitParallelism(const Loop &IR, const clang::ForStmt &AST,
-    const ClangSMParallelProvider &Provider,
+    Function* F, const ClangSMParallelProvider &Provider,
     tsar::ClangDependenceAnalyzer &ASTDepInfo,
     TransformationContext &TfmCtx) override;
 };
@@ -108,7 +108,7 @@ struct ClausePrinter {
 
 bool ClangOpenMPParallelization::exploitParallelism(
     const Loop &IR, const clang::ForStmt &AST,
-    const ClangSMParallelProvider &Provider,
+    Function* F, const ClangSMParallelProvider &Provider,
     tsar::ClangDependenceAnalyzer &ASTDepInfo,
     TransformationContext &TfmCtx) {
   SmallString<128> ParallelFor("#pragma omp parallel for default(shared)");
