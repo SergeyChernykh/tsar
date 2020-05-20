@@ -29,6 +29,7 @@
 #include "tsar/Analysis/Clang/CanonicalLoop.h"
 #include "tsar/Analysis/Clang/LoopMatcher.h"
 #include "tsar/Analysis/Passes.h"
+#include "tsar/Analysis/KnownFunctionTraits.h"
 #include "tsar/Analysis/Parallel/Passes.h"
 #include "tsar/Analysis/Parallel/ParallelLoop.h"
 #include "tsar/Analysis/Memory/MemoryAccessUtils.h"
@@ -54,7 +55,8 @@ namespace {
 using ReductionVarListT = ClangDependenceAnalyzer::ReductionVarListT;
 using SortedVarListT = ClangDependenceAnalyzer::SortedVarListT;
 using FunctionAnalysisResult = std::tuple <DominatorTree*, PostDominatorTree*,
-  TargetLibraryInfo*, AliasTree*, DIMemoryClientServerInfo*>;
+  TargetLibraryInfo*, AliasTree*, DIMemoryClientServerInfo*,
+  const CanonicalLoopSet*, DFRegionInfo*>;
 
 class ParallelRegion;
 class ActualRegion;
@@ -86,8 +88,8 @@ void unionVarRedSets(const std::vector<ForStmt const*>& Fors,
   }
 }
 
-void addVarList(const ClangDependenceAnalyzer::SortedVarListT& VarInfoList,
-  SmallVectorImpl<char>& Clause) {
+void addVarList(const SortedVarListT& VarInfoList,
+    SmallVectorImpl<char>& Clause) {
   Clause.push_back('(');
   auto I = VarInfoList.begin(), EI = VarInfoList.end();
   Clause.append(I->begin(), I->end());
@@ -100,8 +102,8 @@ void addVarList(const ClangDependenceAnalyzer::SortedVarListT& VarInfoList,
 
 /// Add clauses for all reduction variables from a specified list to
 /// the end of `ParallelFor` pragma.
-void addVarList(const ClangDependenceAnalyzer::ReductionVarListT& VarInfoList,
-  SmallVectorImpl<char>& ParallelFor) {
+void addVarList(ReductionVarListT& VarInfoList,
+   SmallVectorImpl<char>& ParallelFor) {
   unsigned I = trait::DIReduction::RK_First;
   unsigned EI = trait::DIReduction::RK_NumberOf;
   for (; I < EI; ++I) {
@@ -141,7 +143,7 @@ void addVarList(const ClangDependenceAnalyzer::ReductionVarListT& VarInfoList,
 class ParallelRegion {
 public:
 
-  ParallelRegion(const ForStmt* AST, const Loop* IR, const Stmt* Parent,
+  ParallelRegion(const ForStmt* AST, Loop* IR, const Stmt* Parent,
       Function* F,
       ClangDependenceAnalyzer::ASTRegionTraitInfo VarInfo, bool IsHost) {
     mLoops.push_back(AST);
@@ -186,7 +188,7 @@ public:
     return IsHost;
   }
 
-  const Loop* GetIrLoop(const ForStmt* AST) {
+  Loop* GetIrLoop(const ForStmt* AST) {
     assert(mIrLoops.count(AST));
     return mIrLoops[AST];
   }
@@ -219,7 +221,8 @@ public:
     assert(mParent == Region.GetParent());
     auto AST = Region.GetLoop();
     assert(std::find(begin(mLoops), end(mLoops), AST) == mLoops.end());
-    assert(!mHostInfo.count(AST) && !mIrLoops.count(AST) && !mVarInfo.count(AST));
+    assert(!mHostInfo.count(AST) && !mIrLoops.count(AST) &&
+      !mVarInfo.count(AST));
     mLoops.push_back(AST);
     mHostInfo[AST] = Region.GetHostInfo(AST);
     mIrLoops[AST] = Region.GetIrLoop(AST);
@@ -318,7 +321,7 @@ private:
   DenseMap<const ForStmt*, bool> mHostInfo;
 
   // IR representation of loop
-  DenseMap<const ForStmt*, const Loop*> mIrLoops;
+  DenseMap<const ForStmt*, Loop*> mIrLoops;
 
   // Var info for pragmas
   DenseMap<const ForStmt*,
@@ -336,7 +339,7 @@ private:
 class ActualRegion {
 public:
 
-  ActualRegion(const ForStmt* AST, const Loop* IR, const Stmt* Parent,
+  ActualRegion(const ForStmt* AST, Loop* IR, const Stmt* Parent,
     Function* F,
     ClangDependenceAnalyzer::ASTRegionTraitInfo VarInfo, bool IsHost) {
     mRegions.push_back({ AST, IR, Parent, F, VarInfo, IsHost});
@@ -364,13 +367,13 @@ public:
     return mRegions[0].GetLoop();
   }
 
-  const Loop* GetLastIRLoop() {
+  Loop* GetLastIRLoop() {
     Sort();
     auto LR = mRegions[mRegions.size() - 1];
     return LR.GetIrLoop(LR.GetLastLoop());
   }
 
-  const Loop* GetFirstIRLoop() {
+  Loop* GetFirstIRLoop() {
     Sort();
     auto LR = mRegions[0];
     return LR.GetIrLoop(LR.GetFirstLoop());
@@ -379,6 +382,10 @@ public:
   ParallelRegion GetParallelRegion() const {
     assert(mRegions.size() == 1);
     return mRegions[0];
+  }
+
+  std::vector<ParallelRegion>& GetParallelRegions() {
+    return mRegions;
   }
 
   void AppendParallelRegion(const ActualRegion& Region) {
@@ -410,6 +417,18 @@ public:
     return mRegions[i];
   }
 
+  std::vector<ParallelRegion>& GetRegions() {
+    return mRegions;
+  }
+
+  void AppendActualRegion(ActualRegion& Region) {
+    assert(mParent == Region.GetParent());
+    assert(mFunction == Region.GetFunction());
+    for (auto PR : Region.GetRegions()) {
+      mRegions.push_back(PR);
+    }
+  }
+
   void InsertPragmas(TransformationContext& TfmCtx) {
     for (auto& Region : mRegions) {
       Region.InsertPragmas(TfmCtx);
@@ -434,7 +453,10 @@ private:
     SmallString<128> DVMHActual;
     if (!mRegions[0].GetUnionHostInfo()) {
       SortedVarListT UnionVarSet;
-      unionVarSets<trait::ReadOccurred>(mRegions[0].GetLoops() , mRegions[0].GetVarInfo(), UnionVarSet);
+      for (auto PR : mRegions) {
+        unionVarSets<trait::ReadOccurred>(PR.GetLoops(),
+          PR.GetVarInfo(), UnionVarSet);
+      }
       if (!UnionVarSet.empty()) {
         DVMHActual += "#pragma dvm actual";
         addVarList(UnionVarSet, DVMHActual);
@@ -452,8 +474,11 @@ private:
     SmallString<128> DVMHGetActual;
     if (!mRegions[0].GetUnionHostInfo()) {
       SortedVarListT UnionVarSet;
-      unionVarSets<trait::WriteOccurred>(mRegions[0].GetLoops(), mRegions[0].GetVarInfo(), UnionVarSet);
-      if (!UnionVarSet.empty()) {
+      for (auto PR : mRegions) {
+        unionVarSets<trait::WriteOccurred>(PR.GetLoops(),
+          PR.GetVarInfo(), UnionVarSet);
+      }
+      if (!UnionVarSet.empty() || true) {
         DVMHGetActual += "#pragma dvm get_actual";
         addVarList(UnionVarSet, DVMHGetActual);
         DVMHGetActual += '\n';
@@ -490,44 +515,85 @@ private:
 
 bool findMemoryOverlap(ActualRegion& R1, ActualRegion& R2,
     TargetLibraryInfo* TLI, AliasTree* AT, DIMemoryClientServerInfo* DIMInfo,
-    DominatorTree* DT) {
+    DominatorTree* DT, const CanonicalLoopSet* CL, DFRegionInfo* RI) {
   auto L1 = R1.GetLastIRLoop();
   auto L2 = R2.GetFirstIRLoop();
   assert(R1.GetFunction() == R2.GetFunction());
   auto F = R1.GetFunction();
   bool skip = true;
+  bool Overlap = false;
   for (auto& CBB = F->begin(), EBB = F->end(); CBB != EBB; CBB++) {
-    if (L1->contains(&*CBB)) {
+     if (L1->contains(&*CBB) || L1->getExitBlock() == (&*CBB)) {
       skip = false;
       continue;
     }
-    if (skip)
+    if (skip) {
       continue;
-    if ((&*CBB) == L2->getHeader())
-      break;
-    for (auto& I = CBB->begin(), E = CBB->end(); I != E; ++I) {
-      Instruction& Inst = *I;
-      bool Overlap = false;
-      for_each_memory(Inst, *TLI,
-        [Overlap, AT, DIMInfo, DT](Instruction& I, MemoryLocation&& Loc, unsigned Idx, 
-          AccessInfo, AccessInfo W) {
-            auto EM = AT->find(Loc);
-            assert(EM && "Estimate memory location must not be null!");
-            auto& DL = I.getModule()->getDataLayout();
-            DIMemory* DIM = DIMInfo->findFromClient(
-              *EM->getTopLevelParent(), DL, *DT).get<Clone>();
-        },
-        [](Instruction& I, AccessInfo, AccessInfo W) {}
-      );
     }
+    if (L2->contains(&*CBB) || L2->getHeader() == (&*CBB)) {
+      continue;
+    }
+    auto CanonicalItr = CL->find_as(RI->getRegionFor(L2));
+    assert(CanonicalItr != CL->end() && (**CanonicalItr).isCanonical());
+    for (auto& I : CBB->instructionsWithoutDebug()) {
+      if (auto II = llvm::dyn_cast<IntrinsicInst>(&I))
+        if (isMemoryMarkerIntrinsic(II->getIntrinsicID()) ||
+          isDbgInfoIntrinsic(II->getIntrinsicID()))
+          continue;
+      if (isa<StoreInst>(I) && (*CanonicalItr)->getInduction() == I.getOperand(1)) {
+        continue;
+      }
+      for_each_memory(I, *TLI,
+         [&Overlap, AT, DIMInfo, DT, &R1, &R2](Instruction& I, MemoryLocation&& Loc,
+           unsigned Idx, AccessInfo, AccessInfo W) {
+             if (W == AccessInfo::No)
+               return;
+             auto EM = AT->find(Loc);
+             assert(EM && "Estimate memory location must not be null!");
+             auto& DL = I.getModule()->getDataLayout();
+             DIMemory* DIM = DIMInfo->findFromClient(
+               *EM->getTopLevelParent(), DL, *DT).get<Clone>();
+             for (auto& PR : R1.GetParallelRegions()) {
+               for (auto AST : PR.GetLoops()) {
+                 Loop* IR = PR.GetIrLoop(AST);
+                 auto DIMIR = DIMInfo->findFromClient(*IR);
+                 for (auto AT : *DIMIR) {
+                   if (AT.find(DIM) != AT.end()) {
+                     Overlap = true;
+                     return;
+                   }
+                 }
+               }
+             }
+             for (auto& PR : R2.GetParallelRegions()) {
+               for (auto AST : PR.GetLoops()) {
+                 Loop* IR = PR.GetIrLoop(AST);
+                 auto DIMIR = DIMInfo->findFromClient(*IR);
+                 for (auto AT : *DIMIR) {
+                   if (AT.find(DIM) != AT.end()) {
+                     Overlap = true;
+                     return;
+                   }
+                 }
+               }
+             }
+         },
+         [](Instruction& I, AccessInfo, AccessInfo W) {}
+         );
+      if (Overlap) {
+        break;
+      }
+    }
+    if (Overlap)
+      break;
   }
-  return true;
+  return Overlap;
 }
 
 class RegionsInfo {
 public:
 
-  void AddSingleRegion(const ForStmt* AST, const Loop* IR, const Stmt* Parent,
+  void AddSingleRegion(const ForStmt* AST, Loop* IR, const Stmt* Parent,
     Function* F,
     ClangDependenceAnalyzer::ASTRegionTraitInfo VarInfo, bool IsHost) {
       mRegions[Parent].push_back({ AST, IR, Parent, F, VarInfo, IsHost});
@@ -546,7 +612,8 @@ public:
       Sort(item.second);
       auto& FA = FuncAnalysis[item.second[0].GetFunction()];
       TryUnionActualRegions(item.first, item.second, std::get<0>(FA),
-        std::get<1>(FA), std::get<2>(FA), std::get<3>(FA), std::get<4>(FA));
+        std::get<1>(FA), std::get<2>(FA), std::get<3>(FA), std::get<4>(FA),
+        std::get<5>(FA), std::get<6>(FA));
     }
   }
 
@@ -596,7 +663,8 @@ private:
   ///   get_actual(A, B)
   ///   ...
   /// Works only if parallel regions have only one loop inside.
-  void TryUnionParallelRegions(const Stmt* Parent, std::vector<ActualRegion>& Regions) {
+  void TryUnionParallelRegions(const Stmt* Parent,
+      std::vector<ActualRegion>& Regions) {
     if (IsParallelRegionUnion)
       return;
     auto& AllChildren = Parent->children();
@@ -626,12 +694,14 @@ private:
   void TryUnionActualRegions(const Stmt* Parent, 
       std::vector<ActualRegion>& Regions, DominatorTree* DT,
       PostDominatorTree* PDT, TargetLibraryInfo* TLI, AliasTree* AT,
-      DIMemoryClientServerInfo* DIMInfo) {
+      DIMemoryClientServerInfo* DIMInfo, const CanonicalLoopSet* CLS, 
+      DFRegionInfo* RI) {
     auto CR = Regions.begin(), NR = Regions.begin();
+    std::vector<ActualRegion> UnionRegions;
+    auto tmpAR = ActualRegion(Parent, Regions[0].GetFunction());
 
+    tmpAR.AppendActualRegion(*CR);
     for (++NR; NR != Regions.end(); ++CR, ++NR) {
-      CR->Dump();
-      NR->Dump();
       assert(CR->GetParent() == NR->GetParent() && CR->GetParent() == Parent);
       auto CPR = CR->GetRegion(0);
       auto NPR = NR->GetRegion(0);
@@ -644,17 +714,28 @@ private:
 
       bool IsPostDom = PDT->dominates(NIRL->getHeader(), CIRL->getHeader());
       bool IsDom = DT->dominates(CIRL->getHeader(), NIRL->getHeader());
-      if (!IsPostDom || !IsDom || findMemoryOverlap(*CR, *NR, TLI, AT, DIMInfo, DT)) {
-        continue;
+      if (!IsPostDom || !IsDom ||
+          findMemoryOverlap(*CR, *NR, TLI, AT, DIMInfo, DT, CLS, RI)) {
+          if (!tmpAR.Empty()) {
+            UnionRegions.push_back(tmpAR);
+            tmpAR.Clear();
+          }
+          tmpAR.AppendActualRegion(*NR);
+      } else {
+        tmpAR.AppendActualRegion(*NR);
       }
     }
+    if (!tmpAR.Empty()) {
+      UnionRegions.push_back(tmpAR);
+    }
+    mRegions[Parent] = UnionRegions;
   }
 private:
   bool IsParallelRegionUnion{ false };
   DenseMap<const Stmt*, std::vector<ActualRegion>> mRegions;
 };
 
-/// This pass try to insert OpenMP directives into a source code to obtain
+/// This pass try to insert DVMH directives into a source code to obtain
 /// a parallel program.
 class ClangDVMHSMParallelization : public ClangSMParallelization {
 public:
@@ -664,7 +745,7 @@ public:
   }
 
 private:
-  bool exploitParallelism(const Loop& IR, const clang::ForStmt& AST,
+  bool exploitParallelism(Loop& IR, const clang::ForStmt& AST,
     Function* F, const ClangSMParallelProvider& Provider,
     tsar::ClangDependenceAnalyzer& ASTDepInfo,
     tsar::TransformationContext& TfmCtx) override;
@@ -683,7 +764,7 @@ private:
 } // namespace
 
 bool ClangDVMHSMParallelization::exploitParallelism(
-    const Loop &IR, const clang::ForStmt &AST,
+    Loop &IR, const clang::ForStmt &AST,
     Function* F, const ClangSMParallelProvider &Provider,
     tsar::ClangDependenceAnalyzer &ASTRegionAnalysis,
     TransformationContext &TfmCtx) {
@@ -701,17 +782,16 @@ bool ClangDVMHSMParallelization::exploitParallelism(
   
   if (mFuncAnalysis.count(F) == 0) {
     auto DIAT = &Provider.get<DIEstimateMemoryPass>().getAliasTree();
-    DIMemoryClientServerInfo DIMInfo(*this, *F, DIAT);
-    if (DIMInfo.isValid())
-      dbgs() << "VALID\n";
-    else
-      dbgs() << "INVALID\n";
-    assert(DIMInfo.isValid());
-      mFuncAnalysis[F] = { &Provider.get<DominatorTreeWrapperPass>().getDomTree(),
+    auto DIMInfo = new DIMemoryClientServerInfo(*this, *F, DIAT);
+    assert(DIMInfo->isValid());
+
+    mFuncAnalysis[F] = { &Provider.get<DominatorTreeWrapperPass>().getDomTree(),
       &Provider.get<PostDominatorTreeWrapperPass>().getPostDomTree(),
       &Provider.get<TargetLibraryInfoWrapperPass>().getTLI(),
       &Provider.get<EstimateMemoryPass>().getAliasTree(),
-      &DIMInfo};
+      DIMInfo,
+      &Provider.get<CanonicalLoopPass>().getCanonicalLoopInfo(),
+      &Provider.get<DFRegionInfoPass>().getRegionInfo()};
   }
   
   return true;
@@ -721,6 +801,7 @@ void ClangDVMHSMParallelization::optimizeLevel(
     tsar::TransformationContext& TfmCtx) {
   mRegionsInfo.TryUnionParallelRegions();
   mRegionsInfo.TryUnionActualRegions(mFuncAnalysis);
+  mRegionsInfo.Dump();
 }
 
 void ClangDVMHSMParallelization::finalize(
