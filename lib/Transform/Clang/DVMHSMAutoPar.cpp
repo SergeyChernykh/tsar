@@ -238,8 +238,9 @@ public:
     for (auto& AST : mLoops) {
       dbgs() << "AST:\n";
       AST->dump();
-      dbgs() << "IR:\n";
-      mIrLoops[AST]->dump();
+      // dbgs() << "IR:\n";
+      // strange error in link stage
+      // mIrLoops[AST]->dump();
     }
   }
 
@@ -442,7 +443,7 @@ public:
       dbgs() << "~~~~~~~~~~~\n";
       region.Dump();
       dbgs() << "~~~~~~~~~~~\n";
-
+  
     }
   }
 
@@ -596,22 +597,27 @@ public:
   void AddSingleRegion(const ForStmt* AST, Loop* IR, const Stmt* Parent,
     Function* F,
     ClangDependenceAnalyzer::ASTRegionTraitInfo VarInfo, bool IsHost) {
-      mRegions[Parent].push_back({ AST, IR, Parent, F, VarInfo, IsHost});
+    if (mRegions.find(Parent) == mRegions.end()) {
+      mRegions[Parent] = { {{ AST, IR, Parent, F, VarInfo, IsHost}}, false };
+    } else {
+      mRegions[Parent].first.push_back({ AST, IR, Parent, F, VarInfo, IsHost });
+    }
   }
   
   void TryUnionParallelRegions() {
     for (auto item: mRegions) {
-      Sort(item.second);
-      TryUnionParallelRegions(item.first, item.second);
+      Sort(item.second.first);
+      TryUnionParallelRegions(item.first, item.second.first, item.second.second);
     }
   }
 
   void TryUnionActualRegions(DenseMap<Function*,
       FunctionAnalysisResult> FuncAnalysis ) {
     for (auto item : mRegions) {
-      Sort(item.second);
-      auto& FA = FuncAnalysis[item.second[0].GetFunction()];
-      TryUnionActualRegions(item.first, item.second, std::get<0>(FA),
+      Sort(item.second.first);
+
+      auto& FA = FuncAnalysis[item.second.first[0].GetFunction()];
+      TryUnionActualRegions(item.first, item.second.first, std::get<0>(FA),
         std::get<1>(FA), std::get<2>(FA), std::get<3>(FA), std::get<4>(FA),
         std::get<5>(FA), std::get<6>(FA));
     }
@@ -619,7 +625,7 @@ public:
 
   void InsertPragmas(TransformationContext& TfmCtx) {
     for (auto& item : mRegions) {
-      for (auto& Region : item.second) {
+      for (auto& Region : item.second.first) {
         Region.InsertPragmas(TfmCtx);
       }
     }
@@ -629,7 +635,7 @@ public:
     for (auto& item : mRegions) {
       dbgs() << "============\nParent: ";
       item.first->dump();
-      for (auto& Region : item.second) {
+      for (auto& Region : item.second.first) {
         dbgs() << "--------------\n";
         Region.Dump();
         dbgs() << "--------------\n";
@@ -664,7 +670,7 @@ private:
   ///   ...
   /// Works only if parallel regions have only one loop inside.
   void TryUnionParallelRegions(const Stmt* Parent,
-      std::vector<ActualRegion>& Regions) {
+      std::vector<ActualRegion>& Regions, bool IsParallelRegionUnion) {
     if (IsParallelRegionUnion)
       return;
     auto& AllChildren = Parent->children();
@@ -687,8 +693,7 @@ private:
     if (!tmpAR.Empty()) {
       UnionRegions.push_back(tmpAR);
     }
-    mRegions[Parent] = UnionRegions;
-    IsParallelRegionUnion = true;
+    mRegions[Parent] = { UnionRegions, true };
   }
 
   void TryUnionActualRegions(const Stmt* Parent, 
@@ -728,11 +733,20 @@ private:
     if (!tmpAR.Empty()) {
       UnionRegions.push_back(tmpAR);
     }
-    mRegions[Parent] = UnionRegions;
+    mRegions[Parent] = { UnionRegions, true };
   }
+
+  void TryTakeOutActualRegionsFromLoop(const Stmt* Parent,
+    std::vector<ActualRegion>& Regions) {
+    if (Regions.size() != 1) {
+      return;
+    }
+
+  }
+
 private:
   bool IsParallelRegionUnion{ false };
-  DenseMap<const Stmt*, std::vector<ActualRegion>> mRegions;
+  DenseMap<const Stmt*, std::pair<std::vector<ActualRegion>, bool>> mRegions;
 };
 
 /// This pass try to insert DVMH directives into a source code to obtain
@@ -777,8 +791,13 @@ bool ClangDVMHSMParallelization::exploitParallelism(
     return false;
   auto & PI = Provider.get<ParallelLoopPass>().getParallelLoopInfo();
   bool IsHost = PI[&IR].isHostOnly() || !ASTRegionAnalysis.evaluateDefUse();
-  
+  dbgs() << "exploitParallelism\n";
+  dbgs() << "input\n";
+  AST.dump();
+  mRegionsInfo.Dump();
   mRegionsInfo.AddSingleRegion(&AST, &IR, Parent, F, ASTDepInfo, IsHost);
+  mRegionsInfo.Dump();
+
   
   if (mFuncAnalysis.count(F) == 0) {
     auto DIAT = &Provider.get<DIEstimateMemoryPass>().getAliasTree();
@@ -799,8 +818,13 @@ bool ClangDVMHSMParallelization::exploitParallelism(
 
 void ClangDVMHSMParallelization::optimizeLevel(
     tsar::TransformationContext& TfmCtx) {
+  dbgs() << "befor\n";
+  mRegionsInfo.Dump();
   mRegionsInfo.TryUnionParallelRegions();
+  dbgs() << "beetwen\n";
+  mRegionsInfo.Dump();
   mRegionsInfo.TryUnionActualRegions(mFuncAnalysis);
+  dbgs() << "after\n";
   mRegionsInfo.Dump();
 }
 
