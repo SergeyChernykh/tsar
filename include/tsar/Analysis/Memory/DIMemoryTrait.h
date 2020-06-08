@@ -125,7 +125,7 @@ public:
     RK_Max,
     RK_Min,
     RK_NoReduction,
-    RK_NumberOf = RK_NoReduction,
+    RK_NumberOf = RK_NoReduction
   };
 
   /// Creates reduction with a specified kind.

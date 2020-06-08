@@ -102,7 +102,13 @@ protected:
     tsar::TransformationContext &TfmCtx) = 0;
 
   /// Perform optimization of parallel loops with a common parent.
-  virtual void optimizeLevel(tsar::TransformationContext &TfmCtx) { }
+  virtual void optimizeLevelLoop(tsar::TransformationContext& TfmCtx, Function& F, Loop* L,
+    ClangSMParallelProvider& Provider) { }
+
+  /// Perform optimization of function with a common parent.
+  virtual void optimizeLevelFunction(tsar::TransformationContext& TfmCtx, Function& F,
+    std::vector<std::pair<const Function*, Instruction*>>& Callees,
+    ClangSMParallelProvider& Provider) { }
 
   /// Final step, insert pragmas in AST
   virtual void finalize(tsar::TransformationContext& TfmCtx) { }
@@ -118,13 +124,12 @@ private:
 
   /// Parallelize outermost parallel loops in the range.
   template <class ItrT>
-  bool findParallelLoops(ItrT I, ItrT EI, Function &F,
+  bool findParallelLoops(Loop* L, ItrT I, ItrT EI, Function &F,
                          ClangSMParallelProvider &Provider) {
     bool Parallelized = false;
     for (; I != EI; ++I)
       Parallelized |= findParallelLoops(**I, F, Provider);
-    if (Parallelized)
-      optimizeLevel(*mTfmCtx);
+    optimizeLevelLoop(*mTfmCtx, F, L, Provider);
     return Parallelized;
   }
 

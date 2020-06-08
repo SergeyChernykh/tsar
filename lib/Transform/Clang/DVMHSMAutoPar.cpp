@@ -169,7 +169,8 @@ protected:
     mBeginLoc(BL), mVarInfo(VarInfo), mPragmaType(PragmaType) {}
 
 public:
-  virtual void Print(tsar::TransformationContext& TfmCtx) const = 0;
+  virtual void print(tsar::TransformationContext& TfmCtx) const = 0;
+  virtual void dump(tsar::TransformationContext& TfmCtx) const = 0;
 
   const SourceLocation& getBeginLoc() const {
     return mBeginLoc;
@@ -205,7 +206,7 @@ public:
     const ASTRegionTraitInfo VarInfo) :
       Pragma(BL, VarInfo, PragmaType::Parallel) {};
 
-  virtual void Print(tsar::TransformationContext& TfmCtx) const override {
+  virtual void print(tsar::TransformationContext& TfmCtx) const override {
     SmallString<128> ParallelFor("#pragma dvm parallel (1)");
     auto& PrivateVarsList = mVarInfo.get<trait::Private>();
     if (!PrivateVarsList.empty()) {
@@ -218,6 +219,10 @@ public:
     auto& Rewriter = TfmCtx.getRewriter();
     Rewriter.InsertTextBefore(mBeginLoc, ParallelFor);
   }
+
+  virtual void dump(tsar::TransformationContext& TfmCtx) const override {
+    dbgs() << "Parallel Loc:" << mBeginLoc.printToString(TfmCtx.getContext().getSourceManager()) << "\n";
+  }
 };
 
 class PragmaRegion : public Pragma {
@@ -228,7 +233,7 @@ public:
     Pragma(BL, VarInfo, PragmaType::Region),
     mIsHost(IsHost), mEndLoc(EL), mLoops(Loops) {}
 
-  virtual void Print(tsar::TransformationContext& TfmCtx) const override {
+  virtual void print(tsar::TransformationContext& TfmCtx) const override {
     SmallString<128> DVMHRegion("#pragma dvm region");
 
     if (mIsHost) {
@@ -255,6 +260,20 @@ public:
     auto& Rewriter = TfmCtx.getRewriter();
     Rewriter.InsertTextBefore(mBeginLoc, DVMHRegion);
     Rewriter.InsertTextAfterToken(mEndLoc, "}");
+  }
+
+  virtual void dump(tsar::TransformationContext& TfmCtx) const override {
+    dbgs() << "Region Loc:" << mBeginLoc.printToString(TfmCtx.getContext().getSourceManager()) << "\n";
+    dbgs() << "Loops:\n";
+    for (auto Loop : mLoops) {
+      dbgs() << "~~~\n";
+      Loop.first->dump();
+      for (auto Block : Loop.second->getBlocksVector()) {
+        Block->dump();
+      }
+      dbgs() << "~~~\n";
+    }
+
   }
 
   const ForStmt* getASTLoop(size_t I) const {
@@ -292,9 +311,15 @@ public:
   explicit PragmaActual(const SourceLocation BL,
     const ASTRegionTraitInfo VarInfo, std::vector<BasicBlock*> Blocks,
     bool IsHost) : Pragma(BL, VarInfo, PragmaType::Actual), mBlocks(Blocks),
-      mIsHost(IsHost) {};
+      mIsHost(IsHost) {
+    assert(!mBlocks.empty());
+    auto F = mBlocks[0]->getParent();
+    for (auto Block : mBlocks) {
+      assert(F == Block->getParent());
+    }
+  };
 
-  virtual void Print(tsar::TransformationContext& TfmCtx) const override {
+  virtual void print(tsar::TransformationContext& TfmCtx) const override {
     SmallString<128> DVMHActual;
     if (!mIsHost) {
       auto& ReadVarSet = mVarInfo.get<trait::ReadOccurred>();
@@ -307,6 +332,14 @@ public:
     if (!DVMHActual.empty()) {
       auto& Rewriter = TfmCtx.getRewriter();
       Rewriter.InsertTextBefore(mBeginLoc, DVMHActual);
+    }
+  }
+
+  virtual void dump(tsar::TransformationContext& TfmCtx) const override {
+    dbgs() << "Actual Loc:" << mBeginLoc.printToString(TfmCtx.getContext().getSourceManager()) << "\n";
+    dbgs() << "Blocks:\n";
+    for (auto& Block : mBlocks) {
+      Block->dump();
     }
   }
 
@@ -335,14 +368,14 @@ private:
   bool mIsHost;
 };
 
-// TODO : UNION with PragmaActual
+// TODO : maybe union with PragmaActual
 class PragmaGetActual : public Pragma {
 public:
   explicit PragmaGetActual(const SourceLocation BL,
     const ASTRegionTraitInfo VarInfo, std::vector<BasicBlock*> Blocks, bool IsHost) :
     Pragma(BL, VarInfo, PragmaType::GetActual), mBlocks(Blocks), mIsHost(IsHost) {};
 
-  virtual void Print(tsar::TransformationContext& TfmCtx) const override {
+  virtual void print(tsar::TransformationContext& TfmCtx) const override {
     SmallString<128> DVMHGetActual;
     if (!mIsHost) {
       auto& WriteVarSet = mVarInfo.get<trait::WriteOccurred>();
@@ -356,6 +389,14 @@ public:
       auto& Rewriter = TfmCtx.getRewriter();
       Rewriter.InsertTextAfterToken(mBeginLoc, "\n");
       Rewriter.InsertTextAfterToken(mBeginLoc, DVMHGetActual);
+    }
+  }
+
+  virtual void dump(tsar::TransformationContext& TfmCtx) const override {
+    dbgs() << "GetActual Loc:" << mBeginLoc.printToString(TfmCtx.getContext().getSourceManager()) << "\n";
+    dbgs() << "Blocks:\n";
+    for (auto& Block : mBlocks) {
+      Block->dump();
     }
   }
 
@@ -478,46 +519,75 @@ bool findMemoryOverlap(T& P1, T& P2, Function& F,
   return Overlap;
 }
 
-class PragmasInfo {
+class Visitor : public RecursiveASTVisitor<Visitor> {
 public:
-  void Insert(const Stmt* parent, Pragma* pragma) {
-    mPragmas[parent].push_back(pragma);
-    sort(parent);
+
+  Visitor(Decl* AST) : mAST(AST) {}
+
+  bool VisitCallExpr(CallExpr* CE) {
+    auto* Callee = CE->getCalleeDecl();
+    if (Callee && mAST == Callee) {
+      mExprs.push_back(CE);
+    }
+    return true;
   }
 
-  void Dump(tsar::TransformationContext& TfmCtx) {
+  const std::vector<Expr*>& getExprs() {
+    return mExprs;
+  }
+
+private:
+  Decl* mAST;
+  std::vector<Expr*> mExprs;
+};
+
+
+class PragmasInfo {
+public:
+  void insert(const Function* F, const Stmt* Parent, Pragma* Pragma) {
+    mPragmas[F][Parent].push_back(Pragma);
+    sort(mPragmas[F][Parent]);
+  }
+
+  void dump(std::string msg, const Function* F, const Loop* L,
+      tsar::TransformationContext& TfmCtx) {
     dbgs() << "--------------\n";
-    for (const auto& item : mPragmas) {
+    dbgs() << msg << "\n";
+    dbgs() << "Dump for function: " << F->getName() << "\n";
+    if (L != nullptr) {
+      dbgs() << "Dump for loop: " << L->getName() << "\n";
+    }
+
+    for (auto& item : mPragmas[F]) {
       dbgs() << "===========\n";
+      dbgs() << "Parent:\n";
       item.first->dump();
       for (const Pragma* Pragma : item.second) {
-        dbgs() << "Pragma: " << Pragma->getName() << "\n";
-        dbgs() << "Loc: ";
-        Pragma->getBeginLoc().dump(TfmCtx.getContext().getSourceManager());
-        dbgs() << "\n";
-
+        Pragma->dump(TfmCtx);
       }
       dbgs() << "===========\n";
     }
-    dbgs() << "------------------\n";
+    dbgs() << "--------------\n";
   }
 
-  virtual void Print(tsar::TransformationContext& TfmCtx) const {
-    for (const auto& item : mPragmas) {
-      for (const Pragma* Pragma : item.second) {
-        if (Pragma->getPragmaType() == PragmaType::Parallel) {
-          Pragma->Print(TfmCtx);
+  virtual void print(tsar::TransformationContext& TfmCtx) const {
+    for (const auto& Funcs : mPragmas) {
+      for (const auto& item : Funcs.second) {
+        for (const Pragma* Pragma : item.second) {
+          if (Pragma->getPragmaType() == PragmaType::Parallel) {
+            Pragma->print(TfmCtx);
+          }
         }
-      }
-      for (const Pragma* Pragma : item.second) {
-        if (Pragma->getPragmaType() == PragmaType::Region) {
-          Pragma->Print(TfmCtx);
+        for (const Pragma* Pragma : item.second) {
+          if (Pragma->getPragmaType() == PragmaType::Region) {
+            Pragma->print(TfmCtx);
+          }
         }
-      }
-      for (const Pragma* Pragma : item.second) {
-        if (Pragma->getPragmaType() == PragmaType::Actual ||
+        for (const Pragma* Pragma : item.second) {
+          if (Pragma->getPragmaType() == PragmaType::Actual ||
             Pragma->getPragmaType() == PragmaType::GetActual) {
-          Pragma->Print(TfmCtx);
+            Pragma->print(TfmCtx);
+          }
         }
       }
     }
@@ -539,8 +609,9 @@ public:
   ///   region
   ///   get_actual(A, B)
   ///   ...
-  void tryUnionRegions() {
-    for (auto& item : mPragmas) {
+  void tryUnionRegions(const Function *F, tsar::TransformationContext& TfmCtx) {
+    //dump("Before UnionRegions", F, nullptr, TfmCtx);
+    for (auto& item : mPragmas[F]) {
       auto Parent = item.first;
       std::vector<Pragma*> Regions;
       std::vector<Pragma*> SavedPragmas;
@@ -553,6 +624,14 @@ public:
         if ((*I)->getPragmaType() == PragmaType::Actual &&
           (*N)->getPragmaType() == PragmaType::GetActual) {
           SavedPragmas.push_back(*I);
+          SavedPragmas.push_back(*N);
+        }
+        if (((*I)->getPragmaType() == PragmaType::Actual &&
+          (*N)->getPragmaType() == PragmaType::Actual)) {
+          SavedPragmas.push_back(*I);
+        }
+        if (((*I)->getPragmaType() == PragmaType::GetActual &&
+          (*N)->getPragmaType() == PragmaType::GetActual)) {
           SavedPragmas.push_back(*N);
         }
       }
@@ -631,18 +710,21 @@ public:
         }
       }
       item.second = NewPragmas;
-      sort(item.first);
+      sort(item.second);
     }
+    //dump("After UnionRegions", F, nullptr, TfmCtx);
   }
 
   template <class T>
-  void tryUnionActualsPragmas(Function& F, ClangSMParallelProvider& Provider,
-    DIMemoryClientServerInfo& DIMInfo) {
+  void tryUnionPragmas(Function* F, DIMemoryClientServerInfo& DIMInfo,
+    ClangSMParallelProvider& Provider, tsar::TransformationContext& TfmCtx) {
+    //dump("Before UnionPragmas", F, nullptr, TfmCtx);
     // static_assert(std::is_same<PragmaActual, T>() || std::is_same<PragmaGetActual, T>());
     PragmaType Type = PragmaType::NoType;
     if constexpr (std::is_same<PragmaActual, T>()) {
       Type = PragmaType::Actual;
-    } else {
+    }
+    else {
       Type = PragmaType::GetActual;
     }
     assert(DIMInfo.isValid());
@@ -654,8 +736,7 @@ public:
     auto RI = &Provider.get<DFRegionInfoPass>().getRegionInfo();
     auto& LI = Provider.get<LoopInfoWrapperPass>().getLoopInfo();
 
-    for (auto& item : mPragmas) {
-      //TODO(): add check than parent is in function
+    for (auto& item : mPragmas[F]) {
       std::vector<Pragma*> ActualPragmas;
       std::copy_if(item.second.begin(), item.second.end(), std::back_inserter(ActualPragmas),
         [Type](const Pragma* Pragma) {
@@ -683,7 +764,7 @@ public:
         bool IsPostDom = PDT->dominates(NPAB, CPAB);
         bool IsDom = DT->dominates(CPAB, NPAB);
         if (!IsPostDom || !IsDom ||
-            findMemoryOverlap(*CPA, *NPA, F, TLI, AT, &DIMInfo, DT, CL, RI)) {
+          findMemoryOverlap(*CPA, *NPA, *F, TLI, AT, &DIMInfo, DT, CL, RI)) {
           if (!TmpUnionPragma.empty()) {
             UnionPragmas.push_back(TmpUnionPragma);
             TmpUnionPragma.clear();
@@ -728,21 +809,147 @@ public:
         }
       }
       item.second = NewPragmas;
-      sort(item.first);
+      sort(item.second);
     }
+    //dump("After UnionPragmas", F, nullptr, TfmCtx);
   }
 
+  template <class T>
+  void tryMovePragmasFromLoop(const Function* F, Loop* L,
+    tsar::TransformationContext& TfmCtx) {
+    //dump("Before MovePragmasFromLoop", F, L, TfmCtx);
+    PragmaType Type = PragmaType::NoType;
+    if constexpr (std::is_same<PragmaActual, T>()) {
+      Type = PragmaType::Actual;
+    } else {
+      Type = PragmaType::GetActual;
+    }
+    for (auto& item : mPragmas[F]) {
+      if (isa<CompoundStmt>(*item.first)) {
+        T* CandPragma = nullptr;
+        for (auto& Pragma : item.second) {
+          if (Pragma->getPragmaType() == Type) {
+            CandPragma = static_cast<T*>(Pragma);
+            if constexpr (std::is_same<PragmaActual, T>()) {
+              break;
+            }
+          }
+        }
+        if (CandPragma == nullptr) {
+          continue;
+        }
+        // check that pragma's bloks contain in parent loop
+        bool Contains = false;
+        for (auto& Block : CandPragma->getBlocks()) {
+          if (L->contains(Block)) {
+            Contains = true;
+            break;
+          }
+        }
+        if (!Contains) {
+          continue;
+        }
+        // create copy of founded pragma
+        auto& ASTCtx = TfmCtx.getContext();
+        auto ASTParentLoop = ASTCtx.getParents(*item.first)[0].get<Stmt>();
+        if (!ASTParentLoop || !isa<ForStmt>(*ASTParentLoop)) {
+          continue;
+        }
+        auto Parent = ASTCtx.getParents(*ASTParentLoop)[0].get<Stmt>();
+        assert(Parent); 
+        SourceLocation SL;
+        if constexpr (std::is_same<PragmaActual, T>()) {
+          SL = ASTParentLoop->getLocStart();
+        } else {
+          Token SemiTok;
+          SL = (!getRawTokenAfter(ASTParentLoop->getLocEnd(),
+            ASTCtx.getSourceManager(), ASTCtx.getLangOpts(), SemiTok)
+            && SemiTok.is(tok::semi))
+            ? SemiTok.getLocation() : ASTParentLoop->getLocEnd();
+        }
+        auto NewActual = new T(SL, CandPragma->getVarInfo(), L->getBlocksVector(),
+          CandPragma->isHost());
+
+        //TODO: Implement split vars for new pragma and old.
+
+        mPragmas[F][Parent].push_back(NewActual);
+        sort(mPragmas[F][Parent]);
+      }
+    }
+    //dump("After MovePragmasFromLoop", F, L, TfmCtx);
+  }
+
+  template <class T>
+  void tryMovePragmasFromFunction(const Function* F,
+      const std::vector<std::pair<const Function*, Instruction*>>& Callees,
+      tsar::TransformationContext& TfmCtx) {
+    PragmaType Type = PragmaType::NoType;
+    if constexpr (std::is_same<PragmaActual, T>()) {
+      Type = PragmaType::Actual;
+    } else {
+      Type = PragmaType::GetActual;
+    }
+
+    auto FuncDecl = TfmCtx.getDeclForMangledName(F->getName());
+    if (!FuncDecl)
+      return;
+    
+    T* CandPragma = nullptr;
+    for (auto& Pragma : mPragmas[F][FuncDecl->getBody()]) {
+      if (Pragma->getPragmaType() == Type) {
+        CandPragma = static_cast<T*>(Pragma);
+        if constexpr (std::is_same<PragmaActual, T>()) {
+          break;
+        }
+      }
+    }
+    if (CandPragma == nullptr) {
+      return;
+    }
+    auto& ASTCtx = TfmCtx.getContext();
+    // create copies of founded pragma
+    for (auto& Callee : Callees) {     
+      //F called by CalleeInst
+      auto CalleeInst = Callee.second;
+      auto CalleeBlock = CalleeInst->getParent();
+      // TODO: Enable after including CallExctractor
+      // assert(CalleeBlock->size() == 1);
+       //F called from CalleeFunction
+      auto CalleeFunction = Callee.first;
+      auto CalleeFunctionDecl =
+        TfmCtx.getDeclForMangledName(CalleeFunction->getName());
+      Visitor V(FuncDecl);
+      V.TraverseDecl(CalleeFunctionDecl);
+      for (const auto& Expr : V.getExprs()) {
+        SourceLocation SL;
+        if (Type == PragmaType::Actual) {
+          SL = Expr->getLocStart();
+        } else {
+          Token SemiTok;
+          SL = (!getRawTokenAfter(Expr->getLocEnd(),
+            ASTCtx.getSourceManager(), ASTCtx.getLangOpts(), SemiTok)
+            && SemiTok.is(tok::semi))
+            ? SemiTok.getLocation() : Expr->getLocEnd();
+        }
+        auto ExprParent = ASTCtx.getParents(*Expr)[0].get<Stmt>();
+        insert(CalleeFunction, ExprParent, 
+          new T(SL, CandPragma->getVarInfo(), { CalleeBlock }, CandPragma->isHost()));
+      }
+    }
+  }
   ~PragmasInfo() {
-    for (const auto& item : mPragmas) {
-      for (const Pragma* Pragma : item.second) {
-        delete Pragma;
+    for (const auto& Funcs : mPragmas) {
+      for (const auto& item : Funcs.second) {
+        for (const Pragma* Pragma : item.second) {
+          delete Pragma;
+        }
       }
     }
   }
 
 private:
-  void sort(const Stmt* parent) {
-    std::sort(mPragmas[parent].begin(), mPragmas[parent].end(),
+  void sort(std::vector<Pragma*>& Pragmas) {
+    std::sort(Pragmas.begin(), Pragmas.end(),
       [](const Pragma* L, const Pragma* R) {
         if (L->getBeginLoc() < R->getBeginLoc()) {
           return true;
@@ -756,7 +963,7 @@ private:
   }
 
 private:
-  DenseMap<const Stmt*, std::vector<Pragma*>> mPragmas;
+  DenseMap<const Function*, DenseMap<const Stmt*, std::vector<Pragma*>>> mPragmas;
 };
 
 /// This pass try to insert DVMH directives into a source code to obtain
@@ -774,7 +981,11 @@ private:
     tsar::ClangDependenceAnalyzer& ASTDepInfo,
     tsar::TransformationContext& TfmCtx) override;
 
-  void optimizeLevel(tsar::TransformationContext& TfmCtx, Function& F,
+  void optimizeLevelLoop(tsar::TransformationContext& TfmCtx, Function& F, Loop* L,
+    ClangSMParallelProvider& Provider) override;
+
+  void optimizeLevelFunction(tsar::TransformationContext& TfmCtx, Function& F,
+    std::vector<std::pair<const Function*, Instruction*>>& Callees,
     ClangSMParallelProvider& Provider) override;
 
   void finalize(tsar::TransformationContext& TfmCtx) override;
@@ -793,7 +1004,6 @@ bool ClangDVMHSMParallelization::exploitParallelism(
     Function* F, const ClangSMParallelProvider &Provider,
     tsar::ClangDependenceAnalyzer &ASTRegionAnalysis,
     TransformationContext &TfmCtx) {
-
   auto& ASTCtx = TfmCtx.getContext();
   auto Parent = ASTCtx.getParents(AST)[0].get<Stmt>();
   auto &ASTDepInfo = ASTRegionAnalysis.getDependenceInfo();
@@ -808,35 +1018,48 @@ bool ClangDVMHSMParallelization::exploitParallelism(
     ASTCtx.getSourceManager(), ASTCtx.getLangOpts(), SemiTok)
     && SemiTok.is(tok::semi))
     ? SemiTok.getLocation() : AST.getLocEnd();
-  mPragmasInfo.Insert(Parent, new PragmaParallel(AST.getLocStart(), ASTDepInfo));
-  mPragmasInfo.Insert(Parent, new PragmaRegion(AST.getLocStart(), EndLoc,
+  mPragmasInfo.insert(F, Parent, new PragmaParallel(AST.getLocStart(), ASTDepInfo));
+  mPragmasInfo.insert(F, Parent, new PragmaRegion(AST.getLocStart(), EndLoc,
     ASTDepInfo, { {&AST, &IR} }, IsHost));
-  mPragmasInfo.Insert(Parent, new PragmaActual(AST.getLocStart(), ASTDepInfo,
+  mPragmasInfo.insert(F, Parent, new PragmaActual(AST.getLocStart(), ASTDepInfo,
     IR.getBlocksVector(), IsHost));
-  mPragmasInfo.Insert(Parent, new PragmaGetActual(EndLoc, ASTDepInfo, 
+  mPragmasInfo.insert(F, Parent, new PragmaGetActual(EndLoc, ASTDepInfo, 
     IR.getBlocksVector(), IsHost));
 
   return true;
 }
 
-void ClangDVMHSMParallelization::optimizeLevel(
-    tsar::TransformationContext& TfmCtx, Function& F,
+void ClangDVMHSMParallelization::optimizeLevelLoop(
+    tsar::TransformationContext& TfmCtx, Function& F, Loop* L,
     ClangSMParallelProvider& Provider) {
-  mPragmasInfo.tryUnionRegions();
+  dbgs() <<  "Opt loop for : " << F.getName() << "\n";
+  mPragmasInfo.tryUnionRegions(&F, TfmCtx);
 
   auto DIAT = &Provider.get<DIEstimateMemoryPass>().getAliasTree();
   auto DIMCSI = DIMemoryClientServerInfo(*this, F, DIAT);
-  mPragmasInfo.tryUnionActualsPragmas<PragmaActual>(F, Provider, DIMCSI);
-  mPragmasInfo.tryUnionActualsPragmas<PragmaGetActual>(F, Provider, DIMCSI);
+  mPragmasInfo.tryUnionPragmas<PragmaActual>(&F, DIMCSI, Provider, TfmCtx);
+  mPragmasInfo.tryUnionPragmas<PragmaGetActual>(&F, DIMCSI, Provider, TfmCtx);
+  
+  if (L != nullptr) {
+    mPragmasInfo.tryMovePragmasFromLoop<PragmaActual>(&F, L, TfmCtx);
+    mPragmasInfo.tryMovePragmasFromLoop<PragmaGetActual>(&F, L, TfmCtx);
+    mPragmasInfo.tryUnionPragmas<PragmaActual>(&F, DIMCSI, Provider, TfmCtx);
+    mPragmasInfo.tryUnionPragmas<PragmaGetActual>(&F, DIMCSI, Provider, TfmCtx);
+  }
+}
 
-
+void ClangDVMHSMParallelization::optimizeLevelFunction(
+    tsar::TransformationContext& TfmCtx, Function& F,
+    std::vector<std::pair<const Function*, Instruction*>>& Callees,
+    ClangSMParallelProvider& Provider) {
+  dbgs() << "Opt Func for : " << F.getName() << "\n";
+  mPragmasInfo.tryMovePragmasFromFunction<PragmaActual>(&F, Callees, TfmCtx);
+  mPragmasInfo.tryMovePragmasFromFunction<PragmaGetActual>(&F, Callees, TfmCtx);
 }
 
 void ClangDVMHSMParallelization::finalize(
   tsar::TransformationContext& TfmCtx) {
-  // dbgs() << "finalize\n";
-  // mPragmasInfo.Dump(TfmCtx);
-  mPragmasInfo.Print(TfmCtx);
+  mPragmasInfo.print(TfmCtx);
 }
 
 ModulePass *llvm::createClangDVMHSMParallelization() {

@@ -87,7 +87,7 @@ bool ClangSMParallelization::findParallelLoops(
   if (!mRegions.empty() &&
       std::none_of(mRegions.begin(), mRegions.end(),
                    [&L](const OptimizationRegion *R) { return R->contain(L); }))
-    return findParallelLoops(L.begin(), L.end(), F, Provider);
+    return findParallelLoops(&L, L.begin(), L.end(), F, Provider);
   auto &PL = Provider.get<ParallelLoopPass>().getParallelLoopInfo();
   auto &CL = Provider.get<CanonicalLoopPass>().getCanonicalLoopInfo();
   auto &RI = Provider.get<DFRegionInfoPass>().getRegionInfo();
@@ -95,7 +95,7 @@ bool ClangSMParallelization::findParallelLoops(
   auto &SrcMgr = mTfmCtx->getRewriter().getSourceMgr();
   auto &Diags = SrcMgr.getDiagnostics();
   if (!PL.count(&L))
-    return findParallelLoops(L.begin(), L.end(), F, Provider);
+    return findParallelLoops(&L, L.begin(), L.end(), F, Provider);
   auto LMatchItr = LM.find<IR>(&L);
   if (LMatchItr != LM.end())
     toDiag(Diags, LMatchItr->get<AST>()->getLocStart(),
@@ -104,7 +104,7 @@ bool ClangSMParallelization::findParallelLoops(
   if (CanonicalItr == CL.end() || !(**CanonicalItr).isCanonical()) {
     toDiag(Diags, LMatchItr->get<AST>()->getLocStart(),
            clang::diag::warn_parallel_not_canonical);
-    return findParallelLoops(L.begin(), L.end(), F, Provider);
+    return findParallelLoops(&L, L.begin(), L.end(), F, Provider);
   }
   auto &Socket = mSocketInfo->getActive()->second;
   auto RF =
@@ -129,9 +129,9 @@ bool ClangSMParallelization::findParallelLoops(
   ClangDependenceAnalyzer RegionAnalysis(const_cast<clang::ForStmt *>(ForStmt),
     *mGlobalOpts, Diags, DIAT, DIDepSet, *DIMemoryMatcher, ASTToClient);
   if (!RegionAnalysis.evaluateDependency())
-    return findParallelLoops(L.begin(), L.end(), F, Provider);
+    return findParallelLoops(&L, L.begin(), L.end(), F, Provider);
   if (!exploitParallelism(L, *ForStmt, &F, Provider, RegionAnalysis, *mTfmCtx))
-    return findParallelLoops(L.begin(), L.end(), F, Provider);
+    return findParallelLoops(&L, L.begin(), L.end(), F, Provider);
   return true;
 }
 
@@ -190,6 +190,25 @@ bool ClangSMParallelization::runOnModule(Module &M) {
                clang::diag::warn_region_not_found) << Name;
   }
   auto &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
+  llvm::DenseMap<const Function*, 
+    std::vector<std::pair<const Function*, Instruction*>>> CaleeInfo;
+
+  for (scc_iterator<CallGraph*> I = scc_begin(&CG); !I.isAtEnd(); ++I) {
+    Function* F = I->front()->getFunction();
+    if (!F || F->isIntrinsic() || F->isDeclaration() ||
+      hasFnAttr(*F, AttrKind::LibFunc))
+      continue;
+    if (!mRegions.empty() && std::all_of(mRegions.begin(), mRegions.end(),
+      [F](const OptimizationRegion* R) {
+        return R->contain(*F) == OptimizationRegion::CS_No;
+      }))
+      continue;
+    for (auto& CallRecord : *I->front()) {
+      Function* Callee = CallRecord.second->getFunction();
+      CaleeInfo[Callee].push_back({ F, cast<Instruction>(CallRecord.first) });
+    }
+  }
+
   for (scc_iterator<CallGraph *> I = scc_begin(&CG); !I.isAtEnd(); ++I) {
     if (I->size() > 1)
       continue;
@@ -207,9 +226,10 @@ bool ClangSMParallelization::runOnModule(Module &M) {
                       << "\n");
     auto &Provider = getAnalysis<ClangSMParallelProvider>(*F);
     auto &LI = Provider.get<LoopInfoWrapperPass>().getLoopInfo();
-    findParallelLoops(LI.begin(), LI.end(), *F, Provider);
-    finalize(*mTfmCtx);
+    findParallelLoops(nullptr, LI.begin(), LI.end(), *F, Provider);
+    optimizeLevelFunction(*mTfmCtx, *F, CaleeInfo[F], Provider);
   }
+  finalize(*mTfmCtx);
   return false;
 }
 

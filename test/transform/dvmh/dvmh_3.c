@@ -1,5 +1,9 @@
-int sum(int(a)[5], int n) {
+static int a[10];
+int n = 10;
+
+int main() {  
   int s = 0;
+
   for (int i = 0; i < n; ++i) {
     a[i] = i;
   }
